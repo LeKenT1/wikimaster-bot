@@ -2977,15 +2977,18 @@
   function wishBidLine(i, n, al) {
     const key = norm(i.title), x = load(K.wishInfo, {})[key];
     const mine = Object.entries(load(K.tracked, {})).filter(([, t]) => t.source === 'wish' && norm(t.title) === key)
-      .sort((p, q) => new Date(p[1].end) - new Date(q[1].end))[0];
+      .sort((p, q) => new Date(p[1].end) - new Date(q[1].end));   // plusieurs avec « tous les exemplaires » : une ligne chacune
     const left = end => end ? `<span class="wleft">⏱ ${fmtLeft(leftMs(end))}</span>` : '';
-    const refresh = `<button class="wbtn ghost" data-a="wishRefresh" data-n="${n}" title="${mine ? 'Actualiser la mise' : 'Lancer la recherche'}">↻</button>`;
+    const refresh = `<button class="wbtn ghost" data-a="wishRefresh" data-n="${n}" title="${mine.length ? 'Actualiser la mise' : 'Lancer la recherche'}">↻</button>`, refreshBtn = refresh;
     const bid = (id, def, label) => `<input type="number" class="wbid" min="1" data-bidn="${n}" data-auction="${id}" value="${def}"><button class="wbtn" data-a="wishBid" data-n="${n}">${label}</button>`;
-    if (mine) {
-      const [id, t] = mine;
-      if (t.leading) return `<div class="wbidl"><span>Ta mise <b>${t.current != null ? t.current : t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="good">✓ en tête</span>${left(t.end)}<span class="wsp"></span>${refresh}</div>`;
-      const need = t.need || (t.current != null ? Math.max(t.current + 1, Math.ceil(t.current * 1.1)) : t.lastBid + 1);
-      return `<div class="wbidl"><span>Ta mise <b>${t.lastBid}</b></span><span class="bad">✗ dépassé${t.current != null ? ' (' + t.current + ')' : ''}</span>${left(t.end)}<span class="wsp"></span>${bid(id, need, 'Surenchérir')}${refresh}</div>`;
+    if (mine.length) {
+      const line = ([id, t], k) => {
+        const refresh = k ? '' : refreshBtn;                 // ↻ une seule fois, sur la première ligne
+        if (t.leading) return `<div class="wbidl"><span>Ta mise <b>${t.current != null ? t.current : t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="good">✓ en tête</span>${left(t.end)}<span class="wsp"></span>${refresh}</div>`;
+        const need = t.need || (t.current != null ? Math.max(t.current + 1, Math.ceil(t.current * 1.1)) : t.lastBid + 1);
+        return `<div class="wbidl"><span>Ta mise <b>${t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="bad">✗ dépassé${t.current != null ? ' (' + t.current + ')' : ''}</span>${left(t.end)}<span class="wsp"></span>${bid(id, need, 'Surenchérir')}${refresh}</div>`;
+      };
+      return (mine.length > 1 ? `<div class="wbidl muted">${mine.length} mises en cours sur cette carte</div>` : '') + mine.map(line).join('');
     }
     if (al) return `<div class="wbidl"><span class="bad">✗ dépassé : il faut <b>${al.price}</b> <b class="r-${al.rarity}">${al.rarity}</b></span>${left(al.end)}<span class="wsp"></span>${bid(al.auctionId, al.price, 'Surenchérir')}<button class="wbtn ghost" data-a="dropAlert" data-n="${n}" title="Laisser tomber cette enchère">Ignorer</button>${refresh}</div>`;
     if (x && x.minId && ['too_expensive', 'no_slot', 'sim', 'refused'].includes(x.status))
@@ -3810,7 +3813,7 @@
         renderTab('wish'); return;
       }
       if (a === 'wishBid') {
-        const it = loadConfig().wishlist.items[Number(btn.dataset.n)], inp = root.querySelector(`[data-bidn="${btn.dataset.n}"]`);
+        const it = loadConfig().wishlist.items[Number(btn.dataset.n)], inp = btn.previousElementSibling && btn.previousElementSibling.matches('input.wbid') ? btn.previousElementSibling : root.querySelector(`[data-bidn="${btn.dataset.n}"]`);   // le champ juste à côté : la bonne enchère quand il y en a plusieurs
         const v = Number(inp && inp.value);
         if (!it || !(v > 0)) return;
         if (!(await ask(`Miser ${v} sur ${it.title} ?${Number(it.max) < v ? ` Ton max passera de ${it.max ?? 'auto'} à ${v}.` : ''}`))) return;
