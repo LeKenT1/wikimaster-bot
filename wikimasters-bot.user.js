@@ -329,6 +329,18 @@
     const r = await api('/api/marketplace?' + p.toString(), {}, retries);
     return r.ok ? r.body : null;
   }
+  // Depuis le 07/10/2026, le site cherche aussi dans la description des cartes : pour un mot courant (« sein »), les
+  // cartes qui portent ce titre peuvent être au-delà des 10 premières pages triées par prix. On lit donc les pages en
+  // alternant trois tris (moins chères, plus chères, récentes) : elles ressortent vite dans l'un ou l'autre.
+  // i = 0, 1, 2… → page Math.floor(i / 3) + 1 du tri TITLE_SORTS[i % 3] ; done : tris épuisés (à passer).
+  const TITLE_SORTS = ['price_asc', 'price_desc', 'recent'];
+  async function searchTitlePage(q, i, done) {
+    const sort = TITLE_SORTS[i % 3];
+    if (done.has(sort)) return { skip: true };
+    const res = await searchMarket({ q, sort, page: Math.floor(i / 3) + 1 });
+    if (res && !res.hasMore) done.add(sort);
+    return res;
+  }
   // Le site trie la collection de façon instable : d'un appel à l'autre une carte peut changer de page (pages qui se
   // chevauchent). On lit donc toutes les pages jusqu'à une page vide, sans s'arrêter sur un doublon, on dédoublonne,
   // et si le total annoncé par le site n'est pas atteint, on relit une seconde fois pour rattraper les cartes manquées.
@@ -710,10 +722,14 @@
       if (mine) { info[key] = { ...(info[key] || {}), at: Date.now(), status: mine.leading ? 'leading' : 'bidding', detail: mine.lastBid }; continue; }
       let leadingAlready = false, errors = 0, ownedSeen = 0;
       const viable = [];
-      for (let page = 1; page <= 10 && !leadingAlready && tour === loopGen; page++) {
-        const res = await searchMarket({ q: item.title, sort: 'price_asc', page });
+      const doneSorts = new Set(), seenIds = new Set();
+      for (let i = 0; i < 12 && doneSorts.size < 3 && !leadingAlready && tour === loopGen; i++) {
+        const res = await searchTitlePage(item.title, i, doneSorts);
+        if (res && res.skip) continue;
         if (!res) { errors++; continue; }                      // page en erreur : on passe à la suivante
         for (const a of res.auctions || []) {
+          if (seenIds.has(a.id)) continue;                     // déjà vue avec un autre tri
+          seenIds.add(a.id);
           if (a.status !== 'active' || norm(titleOf(a.card)) !== key || leftMs(a.end_at) <= 0) continue;
           const rarity = rarityOf(a), amount = minNext(a);
           st.count++;
@@ -724,7 +740,6 @@
           if (a.owned && !config.wishlist.allowDuplicates) { ownedSeen++; cap = 0; }
           if (cap > 0 && amount <= cap) viable.push({ a, rarity, cap, amount });
         }
-        if (!res.hasMore) break;
         await sleep(jitter(400));
       }
       // meilleure rareté d'abord, puis le moins cher
@@ -3597,11 +3612,15 @@
       btn.disabled = true; $('results').innerHTML = '<p class="help">Recherche…</p>';
       const titles = new Map();
       let failed = 0, pages = 0;
-      for (let page = 1; page <= 5; page++) {
-        const res = await searchMarket({ q, sort: 'price_asc', page });
+      const doneSorts = new Set(), seenIds = new Set();
+      for (let i = 0; i < 6 && doneSorts.size < 3; i++) {
+        const res = await searchTitlePage(q, i, doneSorts);
+        if (res && res.skip) continue;
         if (!res) { failed++; continue; }
         pages++;
         for (const a of res.auctions || []) {
+          if (seenIds.has(a.id)) continue;                     // déjà vue avec un autre tri
+          seenIds.add(a.id);
           const t = titleOf(a.card), r = rarityOf(a), price = minNext(a);
           const cur = titles.get(t) || { title: t, rarities: new Set(), min: Infinity, n: 0, exact: norm(t) === norm(q), byRar: {}, cardId: null };
           cur.rarities.add(r); cur.min = Math.min(cur.min, price); cur.n++;
@@ -3609,7 +3628,6 @@
           cur.cardId = cur.cardId || a.card_id || (a.card && a.card.id) || null;
           titles.set(t, cur);
         }
-        if (!res.hasMore) break;
       }
       btn.disabled = false;
       lastResults = new Map([...titles.values()].map(x => [norm(x.title), x]));
