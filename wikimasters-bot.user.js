@@ -3614,9 +3614,15 @@
       btn.disabled = false;
       lastResults = new Map([...titles.values()].map(x => [norm(x.title), x]));
       const inList = new Set(loadConfig().wishlist.items.map(i => norm(i.title)));
-      const list = [...titles.values()].sort((a, b) => (b.exact - a.exact) || a.title.localeCompare(b.title));
+      // depuis le 07/10/2026, le site cherche aussi dans la description des cartes (« Zeus » ramène Grisou, Ginger ale…) :
+      // seules les cartes dont le TITRE contient la recherche restent, titre exact d'abord, puis ceux qui commencent par elle
+      const nq = norm(q), all = [...titles.values()];
+      const list = all.filter(x => norm(x.title).includes(nq))
+        .sort((a, b) => (b.exact - a.exact) || (norm(b.title).startsWith(nq) - norm(a.title).startsWith(nq)) || a.title.localeCompare(b.title));
+      const onlyDesc = all.length - list.length;
       const hasExact = list.some(x => x.exact);
-      $('results').innerHTML = (list.length ? list.map(x => `<div class="result"><div><b>${esc(x.title)}</b>${x.exact ? ' <span class="pill">titre exact</span>' : ''}<br><small class="muted">${x.n} en vente · ${[...x.rarities].map(r => `<b class="r-${r}">${r}</b>`).join(' ')} · dès ${x.min}</small></div>${inList.has(norm(x.title)) ? '<span class="muted">dans ta liste</span>' : `<button data-a="addItem" data-title="${esc(x.title)}">＋ Ajouter</button>`}</div>`).join('') : (failed && !pages ? '<p class="help bad">Le site n’a pas répondu. Réessaie dans quelques secondes.</p>' : '<p class="help">Aucune carte en vente avec ce nom en ce moment.</p>'))
+      $('results').innerHTML = (onlyDesc ? `<p class="help">${onlyDesc} autre${onlyDesc > 1 ? 's cartes ne parlent' : ' carte ne parle'} de « ${esc(q)} » que dans leur description : masquée${onlyDesc > 1 ? 's' : ''}.</p>` : '')
+        + (list.length ? list.map(x => `<div class="result"><div><b>${esc(x.title)}</b>${x.exact ? ' <span class="pill">titre exact</span>' : ''}<br><small class="muted">${x.n} en vente · ${[...x.rarities].map(r => `<b class="r-${r}">${r}</b>`).join(' ')} · dès ${x.min}</small></div>${inList.has(norm(x.title)) ? '<span class="muted">dans ta liste</span>' : `<button data-a="addItem" data-title="${esc(x.title)}">＋ Ajouter</button>`}</div>`).join('') : (failed && !pages ? '<p class="help bad">Le site n’a pas répondu. Réessaie dans quelques secondes.</p>' : '<p class="help">Aucune carte en vente avec ce nom en ce moment.</p>'))
         + (failed && pages ? '<p class="help warn">Le site a mal répondu sur une partie des résultats : relance la recherche pour tout voir.</p>' : '')
         + (hasExact || inList.has(norm(q)) ? '' : `<div class="result"><div class="muted">Ajouter quand même « ${esc(q)} » (titre exact, pas en vente pour l’instant)</div><button data-a="addItem" data-title="${esc(q)}">＋ Ajouter</button></div>`);
     }
