@@ -142,5 +142,5 @@ Onglet **Journal** → **📊 Rapport 24 h** : le bot télécharge un fichier `.
 
 - Le bot ne tourne que tant qu'un onglet WikiMasters est ouvert. Avec plusieurs onglets ouverts, un seul fait tourner le bot ; les autres affichent son état.
 - Le bot peut tourner dans un onglet en arrière-plan : ses minuteurs ne sont pas ralentis par Chrome. Il se cale aussi sur l'heure du site, même si l'horloge de ton PC est décalée.
-- Depuis les versions 2.10 et 3.2, le panneau se met au repos quand personne n'a touché la souris ni le clavier depuis 1 min : ses animations s'arrêtent et l'accueil ne se met plus à jour que toutes les 10 s. Le bot, lui, ne ralentit pas. Ça compte surtout sur un navigateur sans carte graphique, comme celui du NAS, où chaque image animée coûte du processeur.
+- Depuis les versions 2.10 et 3.2, avec la case **Affichage au repos** (Réglages → Général, décochée par défaut), le panneau se met au repos quand personne n'a touché la souris ni le clavier depuis 1 min : ses animations s'arrêtent et l'accueil ne se met plus à jour que toutes les 10 s. Le bot, lui, ne ralentit pas. Ça compte surtout sur un navigateur sans carte graphique, comme celui du NAS, où chaque image animée coûte du processeur.
 - L'automatisation n'est probablement pas autorisée par les règles de WikiMasters : **ton compte peut être bloqué**. Utilise-le à tes risques.

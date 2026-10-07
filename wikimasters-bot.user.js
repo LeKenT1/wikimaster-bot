@@ -37,6 +37,7 @@
     slowUntil: 0,          // mode lent : heure de retour prévue (ms) ; les ventes finissent au plus tard 10 min après
     reserve: 100,
     pollEveryS: 45,
+    calmDisplay: false,    // affichage au repos : sans souris ni clavier depuis 1 min, plus d'animations (économise le processeur, utile sur le NAS)
     maxActiveBids: 10,     // enchères où l'on mise en même temps (limite choisie par l'utilisateur)
     packs: { enabled: true },
     notify: { off: false, blocks: true, packs: false, sales: false, shiny: true, phone: '' },  // notifications du navigateur : tout couper, blocages, paquets ouverts, mises en vente, nouvelles shiny ; phone = sujet ntfy (aussi sur le téléphone)
@@ -3293,6 +3294,7 @@
         ${row('Mode simulation', 'Le bot montre ce qu’il ferait, sans rien dépenser, vendre ni défausser', sw('dryRun', c.dryRun))}
         ${row('Réserve protégée', 'Le bot ne fera jamais descendre ton solde en dessous', num('reserve', c.reserve, 'min="0"'))}
         ${row('Ouvrir les paquets', 'Dès qu’ils sont disponibles', sw('packs.enabled', c.packs.enabled))}
+        ${row('Affichage au repos', 'sans souris ni clavier depuis 1 min, le panneau arrête ses animations et l’accueil ne se met à jour que toutes les 10 s · le bot, lui, continue · utile sur un navigateur sans carte graphique (NAS)', sw('calmDisplay', c.calmDisplay))}
         ${row('Suivre mes enchères toutes les', 'secondes · fin d’enchère : chaque seconde sur les 90 dernières en Turbo, toutes les 2,5 s sur les 45 dernières sinon', num('pollEveryS', c.pollEveryS, 'min="15"'))}
       </div>
       <div class="card"><h3>🔔 Notifications</h3>
@@ -4143,8 +4145,8 @@
     ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'].forEach(e => window.addEventListener(e, wake, { capture: true, passive: true }));
     // horloge : comptes à rebours et texte de veille à jour chaque seconde (toutes les 10 s au repos)
     setInterval(() => {
-      const calm = Date.now() - seenAt > 60000;
-      if (calm && !panel.classList.contains('calm')) panel.classList.add('calm');
+      const calm = !!config.calmDisplay && Date.now() - seenAt > 60000;   // réglage « Affichage au repos », désactivé par défaut
+      if (calm !== panel.classList.contains('calm')) panel.classList.toggle('calm', calm);
       if (calm && ++calmTicks % 10) return;
       if (running && !busy && activity.startsWith('En veille')) { activity = 'En veille · prochaine action ' + nextActionText(); $('ssub').textContent = activity; }
       if (st.tab === 'home') self.refreshHome();
