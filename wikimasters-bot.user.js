@@ -719,8 +719,9 @@
       const key = norm(item.title);
       const st = { at: Date.now(), count: 0, min: null, minRarity: null, minId: null, minEnd: null, status: 'none' };
       const mine = Object.values(tracked).find(t => norm(t.title) === key);
-      if (mine) { info[key] = { ...(info[key] || {}), at: Date.now(), status: mine.leading ? 'leading' : 'bidding', detail: mine.lastBid }; continue; }
-      let leadingAlready = false, errors = 0, ownedSeen = 0;
+      if (mine && !item.all) { info[key] = { ...(info[key] || {}), at: Date.now(), status: mine.leading ? 'leading' : 'bidding', detail: mine.lastBid }; continue; }
+      let leadingAlready = false, errors = 0, ownedSeen = 0, leadingN = 0;
+      const dup = config.wishlist.allowDuplicates || !!item.all;   // « tous les exemplaires » : les doublons comptent aussi
       const viable = [];
       const doneSorts = new Set(), seenIds = new Set();
       for (let i = 0; i < 12 && doneSorts.size < 3 && !leadingAlready && tour === loopGen; i++) {
@@ -733,26 +734,37 @@
           if (a.status !== 'active' || norm(titleOf(a.card)) !== key || leftMs(a.end_at) <= 0) continue;
           const rarity = rarityOf(a), amount = minNext(a);
           st.count++;
-          if (a.owned && !config.wishlist.allowDuplicates) { /* doublon : ne compte pas pour l'alerte de seuil */ }
+          if (a.owned && !dup) { /* doublon : ne compte pas pour l'alerte de seuil */ }
           else if (st.min == null || amount < st.min) { st.min = amount; st.minRarity = rarity; st.minId = a.id; st.minEnd = a.end_at; }
-          if (a.current_bidder_id === me) { leadingAlready = true; st.detail = a.current_bid; break; }
+          if (a.current_bidder_id === me) {
+            if (!item.all) { leadingAlready = true; st.detail = a.current_bid; break; }
+            leadingN++; continue;                                 // tous les exemplaires : on passe aux autres
+          }
+          if (item.all && tracked[a.id]) continue;               // déjà misée, dépassée : la surenchère s'en occupe
           let cap = wishCap(item, rarity);
-          if (a.owned && !config.wishlist.allowDuplicates) { ownedSeen++; cap = 0; }
+          if (a.owned && !dup) { ownedSeen++; cap = 0; }
           if (cap > 0 && amount <= cap) viable.push({ a, rarity, cap, amount });
         }
         await sleep(jitter(400));
       }
       // meilleure rareté d'abord, puis le moins cher
       viable.sort((x, y) => (RANK[y.rarity] - RANK[x.rarity]) || (x.amount - y.amount));
-      const why = 'carte voulue';
+      const why = item.all ? 'carte voulue · tous les exemplaires' : 'carte voulue';
       const best = leadingAlready ? null : viable[0] || null;
 
       if (leadingAlready) st.status = 'leading';
       else if (best) {
-        if (free <= 0) st.status = 'no_slot';
-        else if (await placeBid(best.a, best.amount, { title: titleOf(best.a.card), rarity: best.rarity, cap: best.cap, source: 'wish' }, why)) { st.status = 'bid'; st.detail = best.amount; free--; }
+        // « Acheter tous les exemplaires possibles » : une mise sur chaque exemplaire sous le max, tant qu'il reste des places
+        let placed = 0;
+        for (const v of item.all ? viable : [best]) {
+          if (free <= 0) break;
+          if (await placeBid(v.a, v.amount, { title: titleOf(v.a.card), rarity: v.rarity, cap: v.cap, source: 'wish' }, why)) { if (!placed) st.detail = v.amount; placed++; free--; }
+        }
+        if (placed) st.status = 'bid';
+        else if (free <= 0) st.status = 'no_slot';
         else { st.status = config.dryRun ? 'sim' : 'refused'; st.detail = best.amount; }
       }
+      else if (leadingN) st.status = 'leading';
       else if (!st.count) st.status = errors ? 'error' : 'none';
       else if (ownedSeen === st.count) st.status = 'owned';
       else st.status = 'too_expensive';
@@ -3054,6 +3066,7 @@
               ${wishBidLine(i, n, al)}
               <div class="wopt">
                 <label class="wchk"><input type="checkbox" data-notif="${n}" ${i.notifyOver !== false ? 'checked' : ''}> M’avertir si dépassé</label>
+                <label class="wchk" title="Le bot mise sur chaque exemplaire en vente sous ton max, même si tu as déjà la carte, dans la limite des places d’enchères libres"><input type="checkbox" data-all="${n}" ${i.all ? 'checked' : ''}> Acheter tous les exemplaires possibles</label>
                 <label class="wtagl">Étiquette <input type="text" class="wtag" data-tag="${n}" value="${esc(i.tag || '')}" placeholder="aucune"></label>
               </div>
             </div>`).join('')}</div>` : '<p class="help">Liste vide : cherche une carte ci-dessus.</p>'}
@@ -3554,6 +3567,9 @@
         const a = load(K.analysis, null);
         if (el.checked && a) anaShown(a, anaView()).filter(r => anaFree(r).length).forEach(r => anaSel.add(r.key)); else anaSel.clear();   // libres de la vue affichée
         self.onAnalysis();
+      } else if (el.dataset.all) {
+        const it = config.wishlist.items[Number(el.dataset.all)];
+        if (it) { it.all = el.checked; commit(el.checked ? `${it.title} : tous les exemplaires seront achetés` : `${it.title} : un seul exemplaire`); next.wish = 0; }
       } else if (el.dataset.notif) {
         const it = config.wishlist.items[Number(el.dataset.notif)];
         if (it) { it.notifyOver = el.checked; commit(el.checked ? 'Alerte de dépassement activée' : 'Alerte de dépassement coupée'); if (!el.checked) clearWishAlert(it.title); }
