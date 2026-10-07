@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "WikiMasters Clic",
+  "version": "1.1",
+  "description": "Fait un vrai clic sur un bouton de wiki-masters.com quand le bot WikiMasters le demande (remplace la macro UI Vision).",
+  "permissions": ["debugger", "scripting"],
+  "host_permissions": ["https://www.wiki-masters.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    { "matches": ["https://www.wiki-masters.com/*"], "js": ["content.js"], "run_at": "document_start" }
+  ]
+}
