@@ -272,6 +272,7 @@
 
   let ui = null;
   function log(type, msg, data) {
+    if (/<!doctype|<html/i.test(msg)) msg = msg.replace(/<!doctype[\s\S]*|<html[\s\S]*/i, m => cleanErr(m));   // filet : jamais de page HTML dans le journal
     const e = { t: new Date().toISOString(), type, msg, ...(data ? { data } : {}) };
     const shared = load(K.journal, []);
     shared.push(e);
@@ -317,7 +318,15 @@
     return last || { ok: false, status: 0, body: { error: 'le site ne répond pas' } };
   }
   const post = (path, json) => api(path, { method: 'POST', headers: json ? { 'Content-Type': 'application/json' } : {}, body: json ? JSON.stringify(json) : undefined }, 1);
-  const errOf = r => (r.body && r.body.error) || ('erreur ' + r.status);
+  // Un message d'erreur peut être une page HTML entière (panne du serveur de données, page Cloudflare « 525 ») : on n'en
+  // garde que le titre, et au plus 200 caractères
+  const cleanErr = s => {
+    s = String(s ?? '');
+    if (/<!doctype|<html/i.test(s)) { const t = /<title>([^<]*)<\/title>/i.exec(s); s = 'page d’erreur : ' + (t ? t[1] : s.replace(/<[^>]*>/g, ' ')); }
+    s = s.replace(/\s+/g, ' ').trim();
+    return s.length > 200 ? s.slice(0, 199) + '…' : s;
+  };
+  const errOf = r => cleanErr((r.body && r.body.error) || ('erreur ' + r.status));
 
   async function getBalance() { const r = await api('/api/wikibidous'); return r.ok ? r.body.balance : null; }
   async function getAuction(id) { const r = await api('/api/marketplace/' + id); return r.ok ? (r.body.auction || r.body) : null; }
