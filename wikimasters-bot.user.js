@@ -296,23 +296,44 @@
   }
 
   // ═════════════════════════ API du site ═════════════════════════
+  // ── Santé du site ──
+  // Quand le site rame ou tombe (délais dépassés, erreurs 5xx, « serveur surchargé », page Cloudflare 525…), insister
+  // l'enfonce et allonge les tours (5 tours de plus de 10 min le 07/10 au soir). Après 3 échecs d'affilée, pause des
+  // tâches de fond (recherches, ventes, paquets) : 1 min, puis 2, 4, 8 et 15 min au plus tant que ça dure. Le suivi des
+  // enchères et les mises de dernière seconde continuent, et pendant la pause une requête qui échoue n'est pas réessayée.
+  let siteFails = 0, siteDownUntil = 0, siteDownLevel = 0;
+  const siteDown = () => Date.now() < siteDownUntil;
+  function siteResult(ok) {
+    if (ok) {
+      siteFails = 0;
+      if (siteDownLevel && !siteDown()) { siteDownLevel = 0; log('info', 'Le site répond de nouveau : le bot reprend son rythme normal'); }
+      return;
+    }
+    if (++siteFails < 3 || siteDown()) return;
+    const min = Math.min(15, 2 ** siteDownLevel);
+    siteDownLevel++; siteFails = 0; siteDownUntil = Date.now() + min * 60000;
+    log('warn', `Le site répond mal (3 échecs d’affilée) : pause de ${min} min des recherches, ventes et paquets pour ne pas l’enfoncer. Le suivi de tes enchères continue.`);
+  }
+
   async function api(path, opts = {}, retries = 3) {
     let last = null;
+    if (siteDown()) retries = 1;                                  // site en difficulté : pas d'insistance
     for (let i = 0; i < retries; i++) {
       let r;
       // délai maximal : une requête sans réponse au bout de 20 s est abandonnée (le site se fige parfois)
       const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), opts.timeoutMs || 20000);
       const t0 = Date.now();
-      try { r = await fetch(path, { ...opts, signal: ctrl.signal }); } catch { clearTimeout(to); siteLatency = Math.round(siteLatency * 0.8 + (Date.now() - t0) * 0.2); await sleep(jitter(2500 * (i + 1))); continue; }
+      try { r = await fetch(path, { ...opts, signal: ctrl.signal }); } catch { clearTimeout(to); siteLatency = Math.round(siteLatency * 0.8 + (Date.now() - t0) * 0.2); siteResult(false); if (i + 1 < retries) await sleep(jitter(2500 * (i + 1))); continue; }
       clearTimeout(to);
       siteLatency = Math.round(siteLatency * 0.8 + (Date.now() - t0) * 0.2);
       syncClock(r);
       let body = null;
       try { body = await r.json(); } catch {}
-      if (r.ok) return { ok: true, status: r.status, body };
+      if (r.ok) { siteResult(true); return { ok: true, status: r.status, body }; }
       last = { ok: false, status: r.status, body };
+      siteResult(!(r.status >= 500 || /surcharg/i.test(String((body && (body.error || body.message)) || ''))));
       if (r.status === 429 && body && body.error) return last;      // refus explicite (limite atteinte…) : inutile d'insister
-      if (r.status === 429 || r.status >= 500) { await sleep(jitter(2500 * (i + 1))); continue; }
+      if (r.status === 429 || r.status >= 500) { if (i + 1 < retries) await sleep(jitter(2500 * (i + 1))); continue; }
       return last;
     }
     return last || { ok: false, status: 0, body: { error: 'le site ne répond pas' } };
@@ -2452,7 +2473,7 @@
       // seuil de 3 min, des tours sains étaient relancés et l'ancien continuait en parallèle (recherches en double, site
       // encore plus lent). L'ancien tour s'arrête maintenant à sa prochaine étape (alive) ou page de recherche (tour).
       if (Date.now() - busySince < TOUR_MAX_MS) return;
-      log('warn', `Un tour du bot durait depuis plus de ${TOUR_MAX_MS / 60000} min (le site ne répondait plus) : il repart.`);
+      log('warn', `Un tour du bot durait depuis plus de ${TOUR_MAX_MS / 60000} min : il repart.`);
       notifyUser(`Bot relancé (tour de plus de ${TOUR_MAX_MS / 60000} min)`);
     }
     busy = true; busySince = Date.now();
@@ -2461,6 +2482,11 @@
     try {
       config = loadConfig(); tracked = load(K.tracked, {}); listings = load(K.listings, {}); market = load(K.market, { samples: {} });
       if (!haveLock()) { activity = 'En attente : le bot tourne déjà dans un autre onglet'; return; }
+      if (siteDown()) {                                         // site en difficulté : seulement le suivi des enchères
+        activity = `Site en difficulté : pause des recherches, ventes et paquets jusqu’à ${new Date(siteDownUntil).toTimeString().slice(0, 5)}`;
+        if (Date.now() >= next.follow) { await followBids(); next.follow = Date.now() + 15000; }
+        return;
+      }
       // pause du site : l'extension WikiMasters Clic tente de débloquer (au plus toutes les 2 min), sans attendre une carte à miser
       const paused = Object.keys(humanState());
       if (paused.length) unblockByClick(paused[0]);
