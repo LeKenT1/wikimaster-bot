@@ -132,6 +132,8 @@ Quand le site bloque les mises, les mises en vente ou les paquets, un clic fait 
 - **Vérification humaine demandée :** la page ouvre sa fenêtre de vérification. Si elle ne passe pas d'elle-même, l'onglet reste ouvert et le bot te prévient : fais la vérification, la mise se place toute seule ensuite. L'extension ne touche pas à cette vérification, et ne reclique pas pendant 30 min.
 - **Mise refusée** (ou aucune mise envoyée) : le message du site est noté dans le journal, et l'extension réessaie 2 min plus tard. Après 3 essais sans effet, elle ne réessaie plus que toutes les 15 min et le bot te prévient : une mise à la main débloque tout de suite.
 
+L'extension ne met jamais Chrome au premier plan (pas d'Alt+Tab, même pendant un jeu). Depuis la version 1.2, elle clique aussi quand Chrome est réduit dans la barre des tâches : le temps du clic, elle donne à la page une taille virtuelle, et la fenêtre reste réduite.
+
 Tant que l'extension s'en occupe, le bot n'affiche pas « À toi de jouer ». La version 1.0 de l'extension ne lisait pas la réponse du site : elle croyait réussis des clics que le site refusait. Mets-la à jour (bouton ↻ dans `chrome://extensions`).
 
 ## Rapport 24 h (version 2.10)

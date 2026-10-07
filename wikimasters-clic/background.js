@@ -11,6 +11,10 @@
 //    faite. Si elle ne passe pas d'elle-même dans les 45 s → { ok: true, human: true } : l'onglet reste ouvert et
 //    affiché, la vérification se fait à la main (l'extension n'y touche pas) ;
 //  - autre refus → { ok: false, error: message du site } ; aucune mise envoyée → { ok: false, error }.
+//
+// Chrome réduit (un seul écran, un jeu par-dessus…) : la page fait 0 × 0 pixel et rien n'est cliquable. Le temps du
+// clic, l'extension lui donne une taille virtuelle (Emulation, v1.2) : la fenêtre reste réduite, rien ne passe au premier
+// plan, aucun Alt+Tab.
 
 const SITE = 'https://www.wiki-masters.com/';
 const WAIT_MS = 45000;
@@ -42,7 +46,7 @@ function findButton(text) {
     top.dataset.wmclickHidden = '1';
     top = document.elementFromPoint(x, y);
   }
-  return { x, y, disabled: btn.disabled, clear: !!top && (top === btn || btn.contains(top)) };
+  return { x, y, vw: innerWidth, disabled: btn.disabled, clear: !!top && (top === btn || btn.contains(top)) };
 }
 function restorePage() {
   document.querySelectorAll('[data-wmclick-hidden]').forEach(e => { e.style.removeProperty('visibility'); delete e.dataset.wmclickHidden; });
@@ -106,6 +110,10 @@ async function clickButton({ url, text }, from) {
     const bids = watchBids(tabId);
     try {
       await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
+      if (!spot.vw) {                                       // fenêtre réduite : taille virtuelle le temps du clic
+        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+      }
       await sleep(400);                                   // le bandeau de débogage décale la page : position relue
       spot = await inPage(tabId, findButton, text);
       if (!spot) throw new Error(`bouton « ${text} » disparu`);
