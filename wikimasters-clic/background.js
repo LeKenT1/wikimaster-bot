@@ -101,83 +101,95 @@ async function clickButton({ url, text }, from) {
     tabId = t.id; opened = true;
   }
   
-  await chrome.debugger.attach({ tabId }, '1.3');
-  const bids = watchBids(tabId);
+  let attempts = 0;
   
   try {
-    await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
-    
-    let attempts = 0;
     while (attempts <= MAX_CAPTCHA_RETRIES) {
-      // Vérification initiale de présence de captcha au chargement
-      if (await inPage(tabId, hasCloudflareCaptcha)) {
-        if (attempts >= MAX_CAPTCHA_RETRIES) {
-          keep = true;
-          return { ok: true, human: true, error: 'trop de captchas successifs, intervention humaine requise' };
-        }
-        attempts++;
-        await chrome.tabs.reload(tabId);
-        await sleep(5000);
-        continue;
-      }
+      // Attachement propre du débogueur à chaque tentative
+      await chrome.debugger.attach({ tabId }, '1.3').catch(() => {});
+      const bids = watchBids(tabId);
+      
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
 
-      let spot = null;
-      for (const end = Date.now() + 25000; !spot && Date.now() < end;) {
-        spot = await inPage(tabId, findButton, text);
-        if (!spot) await sleep(500);
-      }
-      if (!spot) throw new Error(`bouton « ${text} » introuvable sur ${url}`);
-
-      if (!spot.vw) {
-        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
-        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
-      }
-      await sleep(400);
-      spot = await inPage(tabId, findButton, text);
-      if (!spot) throw new Error(`bouton « ${text} » disparu`);
-      if (!spot.clear) throw new Error(`bouton « ${text} » recouvert par un autre élément`);
-      if (spot.disabled) throw new Error(`bouton « ${text} » grisé`);
-
-      const mouse = (type, extra = {}) => chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type, x: spot.x, y: spot.y, ...extra });
-      await mouse('mouseMoved');
-      await mouse('mousePressed', { button: 'left', buttons: 1, clickCount: 1 });
-      await mouse('mouseReleased', { button: 'left', buttons: 0, clickCount: 1 });
-      await inPage(tabId, restorePage);
-
-      let captchaDetected = false;
-      for (const end = Date.now() + WAIT_MS; Date.now() < end;) {
+        // Vérification initiale de présence de captcha au chargement
         if (await inPage(tabId, hasCloudflareCaptcha)) {
-          captchaDetected = true;
-          break;
-        }
-        for (const r of bids.results.splice(0)) {
-          if (r.status >= 200 && r.status < 300) return { ok: true, accepted: true };
-          if (isHuman(r.body) || r.status === 403 || r.status === 429) {
-            captchaDetected = true;
-          } else {
-            return { ok: false, error: `mise refusée par le site : ${(r.body && (r.body.error || r.body.message)) || 'erreur ' + r.status}` };
+          bids.stop();
+          await chrome.debugger.detach({ tabId }).catch(() => {});
+          
+          if (attempts >= MAX_CAPTCHA_RETRIES) {
+            keep = true;
+            return { ok: true, human: true, error: 'trop de captchas successifs, intervention humaine requise' };
           }
+          attempts++;
+          await chrome.tabs.reload(tabId);
+          await sleep(8000); // Laisse le temps à Cloudflare de valider le challenge
+          continue;
         }
-        if (captchaDetected) break;
-        await bids.next(Math.max(0, end - Date.now()));
-      }
 
-      if (captchaDetected) {
-        attempts++;
-        if (attempts > MAX_CAPTCHA_RETRIES) {
-          keep = true;
-          return { ok: true, human: true, error: 'trop de captchas, intervention humaine requise' };
+        let spot = null;
+        for (const end = Date.now() + 25000; !spot && Date.now() < end;) {
+          spot = await inPage(tabId, findButton, text);
+          if (!spot) await sleep(500);
         }
-        await chrome.tabs.reload(tabId);
-        await sleep(5000);
-        continue;
-      }
+        if (!spot) throw new Error(`bouton « ${text} » introuvable sur ${url}`);
 
-      throw new Error('le clic n’a envoyé aucune mise au site en 45 s');
+        if (!spot.vw) {
+          await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+          await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+        }
+        await sleep(400);
+        spot = await inPage(tabId, findButton, text);
+        if (!spot) throw new Error(`bouton « ${text} » disparu`);
+        if (!spot.clear) throw new Error(`bouton « ${text} » recouvert par un autre élément`);
+        if (spot.disabled) throw new Error(`bouton « ${text} » grisé`);
+
+        const mouse = (type, extra = {}) => chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type, x: spot.x, y: spot.y, ...extra });
+        await mouse('mouseMoved');
+        await mouse('mousePressed', { button: 'left', buttons: 1, clickCount: 1 });
+        await mouse('mouseReleased', { button: 'left', buttons: 0, clickCount: 1 });
+        await inPage(tabId, restorePage);
+
+        let captchaDetected = false;
+        for (const end = Date.now() + WAIT_MS; Date.now() < end;) {
+          if (await inPage(tabId, hasCloudflareCaptcha)) {
+            captchaDetected = true;
+            break;
+          }
+          for (const r of bids.results.splice(0)) {
+            if (r.status >= 200 && r.status < 300) return { ok: true, accepted: true };
+            if (isHuman(r.body) || r.status === 403 || r.status === 429) {
+              captchaDetected = true;
+            } else {
+              return { ok: false, error: `mise refusée par le site : ${(r.body && (r.body.error || r.body.message)) || 'erreur ' + r.status}` };
+            }
+          }
+          if (captchaDetected) break;
+          await bids.next(Math.max(0, end - Date.now()));
+        }
+
+        bids.stop();
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+
+        if (captchaDetected) {
+          attempts++;
+          if (attempts > MAX_CAPTCHA_RETRIES) {
+            keep = true;
+            return { ok: true, human: true, error: 'trop de captchas, intervention humaine requise' };
+          }
+          await chrome.tabs.reload(tabId);
+          await sleep(8000);
+          continue;
+        }
+
+        throw new Error('le clic n’a envoyé aucune mise au site en 45 s');
+        
+      } finally {
+        bids.stop();
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+      }
     }
   } finally {
-    bids.stop();
-    await chrome.debugger.detach({ tabId }).catch(() => {});
     await inPage(tabId, restorePage);
     if (opened && !keep) await chrome.tabs.remove(tabId).catch(() => {});
     if (!keep && before && before.id !== tabId) await chrome.tabs.update(before.id, { active: true }).catch(() => {});
