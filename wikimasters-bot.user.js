@@ -2730,7 +2730,7 @@
     return new Promise(resolve => {
       const done = r => { clearTimeout(to); window.removeEventListener('message', on); resolve(r || { ok: false, error: 'réponse vide' }); };
       const on = e => { if (e.source === window && e.data && e.data.wmclickReply && e.data.wmclickReply.id === id) done(e.data.wmclickReply); };
-      const to = setTimeout(() => done({ ok: false, error: 'pas de réponse de l’extension en 90 s' }), 90000);
+      const to = setTimeout(() => done({ ok: false, error: 'pas de réponse de l’extension en 300 s' }), 300000);   // jusqu’à 3 rechargements sur captcha Cloudflare
       window.addEventListener('message', on);
       window.postMessage({ wmclick: { id, url: req.url, text: req.text } }, '*');
     });
@@ -2761,7 +2761,9 @@
         }
       } else if (r.human) {
         clickHuman = true; clickNext = Date.now() + CLICK_HUMAN_MS;
-        log('alert', 'Déblocage par clic : le site demande une vérification humaine. L’onglet de l’enchère est resté ouvert : fais la vérification, la mise se place toute seule ensuite.');
+        log('alert', r.cloudflare
+          ? 'Déblocage par clic : captcha Cloudflare toujours là après plusieurs rechargements. L’onglet de l’enchère est resté ouvert : fais la vérification, puis mise à la main.'
+          : 'Déblocage par clic : le site demande une vérification humaine. L’onglet de l’enchère est resté ouvert : fais la vérification, la mise se place toute seule ensuite.');
         notifyUser('Vérification humaine à faire : l’onglet de l’enchère est ouvert', 'blocks');
       } else {
         if (r.accepted) {
