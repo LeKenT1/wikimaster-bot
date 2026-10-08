@@ -2658,11 +2658,11 @@
     all[key] = { msg, at: Date.now(), site };
     save(K.human, all);
     log('alert', `${HUMAN_NAMES[key] || key} en pause : ${msg}${site ? ` (réponse du site : « ${site} »)` : ''}`);
-    notifyUser(`${HUMAN_NAMES[key] || key} en pause : vérification à faire`);
+    if (!clickReady()) notifyUser(`${HUMAN_NAMES[key] || key} en pause : vérification à faire`);   // sinon : notification « en cours » de l'extension
     ui && ui.onHuman();
   }
   function clearHuman(key, byClick = false) {
-    if (!byClick) { clickStreak = 0; clickHuman = false; }   // action acceptée (ou « Fait ») : l'extension peut de nouveau cliquer
+    if (!byClick) { clickStreak = 0; clickHuman = false; verifStop(true); }   // action acceptée (ou « Fait ») : l'extension peut de nouveau cliquer, notification retirée
     const all = humanState();
     if (!all[key]) return;
     delete all[key];
@@ -2711,10 +2711,11 @@
   // comme une souris. Sur un blocage, le bot lui demande d'ouvrir la page réglée et d'y cliquer le bouton (« Miser ») : c'est
   // ce que faisait la macro UI Vision en surveillant l'encadré. La case « Vérifiez que vous êtes humain » reste à cocher à la main.
   // Bot ⇄ extension : window.postMessage, relayé par le script de contenu de l'extension (dossier wikimasters-clic).
-  const CLICK_EVERY_MS = 2 * 60000, CLICK_SLOW_MS = 15 * 60000, CLICK_MAX = 3, CLICK_HUMAN_MS = 30 * 60000;
-  // clickStreak : essais depuis la dernière action acceptée par le site ; après CLICK_MAX essais sans effet, un essai
-  // toutes les 15 min seulement (« Miser » place une vraie mise). clickHuman : le site demande une vérification humaine,
-  // l'onglet de l'enchère est resté ouvert pour toi ; pas de nouveau clic avant 30 min ou avant une action acceptée.
+  const CLICK_RETRY_MS = 60000, CLICK_SLOW_MS = 15 * 60000, CLICK_MAX = 2, CLICK_HUMAN_MS = 30 * 60000;
+  // clickStreak : essais depuis la dernière action acceptée par le site. Un essai raté → nouvel essai 1 min plus tard ;
+  // CLICK_MAX essais ratés → « Échec de la vérification », puis un essai toutes les 15 min seulement (« Miser » place une
+  // vraie mise). clickHuman : vérification humaine toujours pas passée après le dernier essai, l'onglet de l'enchère est
+  // resté ouvert pour toi ; pas de nouveau clic avant 30 min ou avant une action acceptée.
   let clickExt = null, clickBusy = false, clickNext = 0, clickLastAt = 0, clickStreak = 0, clickHuman = false;
   const clickReady = () => !!clickExt && config.unblock.on && !!config.unblock.url && !config.dryRun;   // jamais en simulation : le clic est réel
   const clickHandles = () => clickReady() && !clickHuman;                                             // l'extension s'occupe des blocages
@@ -2730,11 +2731,34 @@
     return new Promise(resolve => {
       const done = r => { clearTimeout(to); window.removeEventListener('message', on); resolve(r || { ok: false, error: 'réponse vide' }); };
       const on = e => { if (e.source === window && e.data && e.data.wmclickReply && e.data.wmclickReply.id === id) done(e.data.wmclickReply); };
-      const to = setTimeout(() => done({ ok: false, error: 'pas de réponse de l’extension en 300 s' }), 300000);   // jusqu’à 3 rechargements sur captcha Cloudflare
+      const to = setTimeout(() => done({ ok: false, error: 'pas de réponse de l’extension en 300 s' }), 300000);   // l’extension attend jusqu’à 280 s qu’un captcha passe de lui-même
       window.addEventListener('message', on);
       window.postMessage({ wmclick: { id, url: req.url, text: req.text } }, '*');
     });
   }
+  // Une seule notification du navigateur pour tout le déblocage (même tag, remplacée sur place) : « en cours », décompte
+  // avant le nouvel essai, échec ; retirée dès que la mise passe. Le téléphone (ntfy) ne reçoit que l'échec.
+  let verifN = null, verifT = null;
+  function verifNotify(msg, loud = true) {
+    if (!msg) { try { verifN && verifN.close(); } catch {} verifN = null; return; }
+    if (config.notify.off || !config.notify.blocks) return;
+    try {
+      if (Notification.permission === 'granted')
+        verifN = new Notification('🤖 WikiMasters Bot', { body: msg, tag: 'wmbot-verif', renotify: loud, silent: !loud, requireInteraction: true });
+    } catch {}
+  }
+  function verifStop(close = false) { clearInterval(verifT); verifT = null; if (close) verifNotify(null); }
+  function verifCountdown(why) {
+    verifStop();
+    let first = true;
+    const tick = () => {
+      const left = Math.ceil((clickNext - Date.now()) / 1000);
+      if (left <= 0) return verifStop();
+      verifNotify(`${why} Nouvel essai dans ${left} s`, first); first = false;
+    };
+    tick(); verifT = setInterval(tick, 1000);
+  }
+
   // key : l'activité bloquée ; test = true : clic demandé depuis les Réglages, sans blocage ni attente
   async function unblockByClick(key, test = false) {
     const u = config.unblock;
@@ -2748,24 +2772,35 @@
     clickBusy = true;
     if (!test) {
       clickStreak++; clickLastAt = Date.now();
-      clickNext = Date.now() + (clickStreak >= CLICK_MAX ? CLICK_SLOW_MS : CLICK_EVERY_MS);
+      clickNext = Date.now() + CLICK_SLOW_MS;                   // recalculé selon le résultat
       log('info', `${HUMAN_NAMES[key] || key} bloquées : l’extension clique « ${u.button} » sur ${u.url} (essai ${clickStreak})`);
+      verifStop();
+      verifNotify(`${HUMAN_NAMES[key] || key} bloquées : vérification en cours…${clickStreak > 1 ? ` (essai ${clickStreak})` : ''}`, clickStreak <= CLICK_MAX);
     }
     try {
       const r = await askClick({ url: u.url, text: u.button });
-      if (!r.ok) {
-        log('warn', `Déblocage par clic : ${r.error}`);
-        if (!test && clickStreak === CLICK_MAX) {
-          log('alert', `Déblocage par clic : ${CLICK_MAX} clics d’affilée sans effet, l’extension ne réessaiera plus que toutes les 15 min. Une mise à la main débloque tout de suite.`);
-          notifyUser('Le clic de l’extension ne débloque pas : une mise à la main débloque tout de suite', 'blocks');
+      if (!r.ok || r.human) {
+        const why = !r.ok ? r.error
+          : r.cloudflare ? 'captcha Cloudflare pas passé de lui-même en plus de 4 min'
+          : 'vérification humaine pas passée d’elle-même en plus de 4 min';
+        log('warn', `Déblocage par clic : ${why}`);
+        if (test) return r;
+        if (clickStreak < CLICK_MAX) {                         // 1er essai raté : nouvel essai dans 1 min, avec décompte
+          clickNext = Date.now() + CLICK_RETRY_MS;
+          verifCountdown(`Vérification pas passée (${why}).`);
+        } else {
+          verifStop();
+          if (r.human) { clickHuman = true; clickNext = Date.now() + CLICK_HUMAN_MS; }
+          const msg = `Échec de la vérification après ${clickStreak} essais (${why}). ` + (r.human
+            ? 'L’onglet de l’enchère est resté ouvert : fais la vérification, la mise se place toute seule ensuite.'
+            : 'L’extension ne réessaiera plus que toutes les 15 min. Une mise à la main débloque tout de suite.');
+          const first = clickStreak === CLICK_MAX;               // essais suivants (toutes les 15 min) : mise à jour en silence
+          if (first) log('alert', `Déblocage par clic : ${msg}`);
+          verifNotify(msg, first);
+          if (first && !config.notify.off && config.notify.blocks) phoneNotify(msg, 'blocks');
         }
-      } else if (r.human) {
-        clickHuman = true; clickNext = Date.now() + CLICK_HUMAN_MS;
-        log('alert', r.cloudflare
-          ? 'Déblocage par clic : captcha Cloudflare toujours là après plusieurs rechargements. L’onglet de l’enchère est resté ouvert : fais la vérification, puis mise à la main.'
-          : 'Déblocage par clic : le site demande une vérification humaine. L’onglet de l’enchère est resté ouvert : fais la vérification, la mise se place toute seule ensuite.');
-        notifyUser('Vérification humaine à faire : l’onglet de l’enchère est ouvert', 'blocks');
       } else {
+        verifStop(true);                                         // vérification passée : notification retirée
         if (r.accepted) {
           log('info', `Déblocage par clic : mise acceptée par le site, blocage levé`);
           if (key) clearHuman(key);                            // mise acceptée par le site : la pause se lève, le bot reprend
@@ -4062,7 +4097,7 @@
           const auto = clickHandles();                         // l'extension WikiMasters Clic s'en occupe : rien à faire à la main
           pz.innerHTML = hs.length ? `<div class="card" style="border:2px solid #3b82f6"><h3>${auto ? '🖱 Bloqué par le site : l’extension s’en occupe' : '⏸ En pause : le site demande une vérification'}</h3>
             <p class="help">${auto
-              ? `L’extension WikiMasters Clic clique « ${esc(config.unblock.button)} » sur ta page de déblocage, puis le bot reprend aussitôt : rien à faire. Si le site bloque encore, elle réessaie toutes les 2 min, puis toutes les 15 min après ${CLICK_MAX} essais sans effet.${clickLastAt ? ` Dernier clic à ${new Date(clickLastAt).toTimeString().slice(0, 5)}.` : ''}`
+              ? `L’extension WikiMasters Clic clique « ${esc(config.unblock.button)} » sur ta page de déblocage, puis le bot reprend aussitôt : rien à faire. Si le site bloque encore, elle réessaie 1 min plus tard, puis toutes les 15 min après ${CLICK_MAX} essais sans effet.${clickLastAt ? ` Dernier clic à ${new Date(clickLastAt).toTimeString().slice(0, 5)}.` : ''}`
               : `${clickHuman ? 'Le site demande une vérification humaine : l’onglet de l’enchère est resté ouvert, fais la vérification (la mise se place toute seule ensuite), puis clique le bouton. ' : ''}Fais l’action une fois à la main sur le site (miser, mettre une carte en vente ou ouvrir un paquet), puis clique le bouton. Le bot réessaie aussi tout seul toutes les 10 min, mais pour les enchères seulement s’il trouve une carte à miser.`}</p>
             ${hs.map(([k, x]) => `<div class="stkbar"><span><b>${HUMAN_NAMES[k] || k}</b> <span class="muted">· depuis ${new Date(x.at).toTimeString().slice(0, 5)}</span></span><button data-a="humanDone" data-key="${esc(k)}">C’est fait, reprendre</button></div>`).join('')}</div>` : '';
         }
@@ -4321,7 +4356,7 @@
         if (!open[m[1]]) { open[m[1]] = { what: m[1], start: at(e), end: null, how: null }; blocks.push(open[m[1]]); slot(at(e)).blocks++; }
       } else if (e.type === 'info' && (m = /^(\S+) : (?:reprise après (le clic de l’extension|ta vérification)|de nouveau acceptées)/.exec(e.msg))) {
         if (open[m[1]]) { open[m[1]].end = at(e); open[m[1]].how = m[2] === 'le clic de l’extension' ? 'le clic de l’extension' : 'une action acceptée'; delete open[m[1]]; }
-      } else if (/^Déblocage par clic : /.test(e.msg) && !/clics d’affilée/.test(e.msg)) {
+      } else if (/^Déblocage par clic : /.test(e.msg) && !/clics d’affilée|Échec de la vérification/.test(e.msg)) {
         const ok = e.type !== 'warn';
         clicks.push({ t: at(e), ok, human: /cocher|vérification humaine/.test(e.msg), msg: ok ? '' : e.msg.replace(/^Déblocage par clic : /, '') });
       }
@@ -4334,7 +4369,7 @@
       packs: count('pack', /^Paquet ouvert/), discards: count('discard'), errors: count('error'),
       scans, deals, scanSecs,
       blocks: blocks.map(b => ({ ...b, end: b.end || now, open: !b.end })),
-      clicks, gaveUp: count('alert', /clics d’affilée/),
+      clicks, gaveUp: count('alert', /clics d’affilée|Échec de la vérification/),
       watchdog: count('warn', /^(Le bot était bloqué depuis plus de|Un tour du bot durait depuis plus de)/),
       stock: { n: held.length, cost: held.reduce((s, p) => s + (p.cost || 0), 0) },
     };

@@ -8,24 +8,23 @@
 // la mise (v1.1 ; la 1.0 ne regardait que la page pendant 5 s et croyait réussis des clics que le site refusait) :
 //  - mise acceptée → { ok: true, accepted: true } ; l'onglet se ferme et tu retrouves celui où tu étais ;
 //  - « human_verification_required » → la page ouvre sa fenêtre de vérification humaine, qui replace la mise une fois
-//    faite. Si elle ne passe pas d'elle-même dans les 45 s → { ok: true, human: true } : l'onglet reste ouvert et
-//    affiché, la vérification se fait à la main (l'extension n'y touche pas) ;
+//    faite. Elle passe souvent d'elle-même en 30 s à 1 min : l'extension attend la mise acceptée jusqu'au bout de son
+//    budget (280 s). Toujours rien → { ok: true, human: true } : l'onglet reste ouvert et affiché, la vérification se
+//    fait à la main (l'extension n'y touche pas) ;
 //  - autre refus → { ok: false, error: message du site } ; aucune mise envoyée → { ok: false, error }.
 //
-// Captcha Cloudflare (v1.3) : page « Un instant… », case Turnstile, ou réponse à la mise marquée cf-mitigated. S'il ne
-// passe pas de lui-même en 15 s, l'extension recharge la page et reclique, 3 fois au plus. L'onglet du bot n'est jamais
-// rechargé (le bot attend la réponse dedans) : la page s'ouvre alors dans un nouvel onglet. Toujours là après 3
-// rechargements → { ok: true, human: true, cloudflare: true } : l'onglet reste ouvert, la vérification se fait à la main.
+// Captcha Cloudflare : page « Un instant… », case Turnstile, ou réponse à la mise marquée cf-mitigated. La v1.3
+// rechargeait la page au bout de 15 s, ce qui relançait le captcha à zéro alors qu'il passe de lui-même en 30 s à 1 min.
+// La v1.4 ne recharge plus : elle attend (jusqu'au bout du budget) que le captcha passe et que la mise soit acceptée.
+// Toujours là → { ok: true, human: true, cloudflare: true } : l'onglet reste ouvert, la vérification se fait à la main.
 //
 // Chrome réduit (un seul écran, un jeu par-dessus…) : la page fait 0 × 0 pixel et rien n'est cliquable. Le temps du
 // clic, l'extension lui donne une taille virtuelle (Emulation, v1.2) : la fenêtre reste réduite, rien ne passe au premier
 // plan, aucun Alt+Tab.
 
 const SITE = 'https://www.wiki-masters.com/';
-const WAIT_MS = 45000;
-const CF_PASS_MS = 15000;     // délai laissé au captcha Cloudflare pour passer de lui-même avant de recharger
-const CF_RELOADS = 3;
-const BUDGET_MS = 280000;     // le bot attend la réponse 300 s : pas de nouveau rechargement s'il reste moins de 100 s
+const WAIT_MS = 45000;        // délai pour que le clic envoie une mise (sans vérification ni captcha en route)
+const BUDGET_MS = 280000;     // le bot attend la réponse 300 s : captcha et vérification ont jusque-là pour passer
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let busy = false;
 
@@ -113,43 +112,31 @@ async function clickButton({ url, text }, from) {
   if (same) await chrome.tabs.update(tabId, { active: true });
   else {
     target.hash = 'wmclick';
+    // onglet resté ouvert par l'essai précédent (vérification pas passée) : refermé, la page repart d'un onglet neuf
+    for (const t of await chrome.tabs.query({ url: SITE + '*' })) if (t.url === target.href) await chrome.tabs.remove(t.id).catch(() => {});
     const t = await chrome.tabs.create({ url: target.href, active: true, openerTabId: from.id, windowId: from.windowId, index: from.index + 1 });
     tabId = t.id; opened = true;
   }
-  const end = Date.now() + BUDGET_MS;
   try {
-    for (let reloads = 0; ; reloads++) {
-      const r = await clickOnce(tabId, text, url);
-      if (!r.cloudflare) { if (r.human) keep = true; return r; }
-      if (reloads >= CF_RELOADS || end - Date.now() < 100000) { keep = true; return { ok: true, human: true, cloudflare: true }; }
-      if (opened) await chrome.tabs.reload(tabId, { bypassCache: true });
-      else {                                              // onglet du bot : jamais rechargé, la page s'ouvre à côté
-        target.hash = 'wmclick';
-        const t = await chrome.tabs.create({ url: target.href, active: true, openerTabId: from.id, windowId: from.windowId, index: from.index + 1 });
-        tabId = t.id; opened = true;
-      }
-      await sleep(1500);                                  // laisse partir l'ancienne page avant de chercher le bouton
-    }
+    const r = await clickOnce(tabId, text, url, Date.now() + BUDGET_MS);
+    if (r.human) keep = true;
+    return r;
   } finally {
     if (opened && !keep) await chrome.tabs.remove(tabId).catch(() => {});
     if (!keep && before && before.id !== tabId) await chrome.tabs.update(before.id, { active: true }).catch(() => {});
   }
 }
 
-// Un essai : attend le bouton, clique, lit la réponse du site. { cloudflare: true } : captcha Cloudflare resté affiché
-// plus de 15 s, la page est à recharger.
-async function clickOnce(tabId, text, url) {
-  let spot = null, cfSince = 0;
-  for (const end = Date.now() + 25000; !spot && (Date.now() < end || cfSince);) {
-    if (await inPage(tabId, cloudflare)) {
-      cfSince = cfSince || Date.now();
-      if (Date.now() - cfSince > CF_PASS_MS) return { cloudflare: true };
-    } else {
-      cfSince = 0;
-      spot = await inPage(tabId, findButton, text);
-    }
+// Attend le bouton, clique, lit la réponse du site. Captcha ou vérification humaine en route : attente jusqu'à
+// `deadline`, sans recharger (la page replace la mise d'elle-même une fois passés).
+async function clickOnce(tabId, text, url, deadline) {
+  let spot = null, cf = false;
+  for (const end = Date.now() + 25000; !spot && Date.now() < (cf ? deadline : end);) {
+    if (await inPage(tabId, cloudflare)) cf = true;   // page « Un instant… » : on la laisse passer
+    else spot = await inPage(tabId, findButton, text);
     if (!spot) await sleep(500);
   }
+  if (!spot && cf) return { ok: true, human: true, cloudflare: true };
   if (!spot) throw new Error(`bouton « ${text} » introuvable sur ${url}`);
   await chrome.debugger.attach({ tabId }, '1.3');
   const bids = watchBids(tabId);
@@ -169,22 +156,21 @@ async function clickOnce(tabId, text, url) {
     await mouse('mousePressed', { button: 'left', buttons: 1, clickCount: 1 });
     await mouse('mouseReleased', { button: 'left', buttons: 0, clickCount: 1 });
     await inPage(tabId, restorePage);
-    // attente de la réponse du site ; après une demande de vérification, la page replace la mise une fois vérifiée.
-    // Un captcha Cloudflare affiché (ou une mise arrêtée par Cloudflare) qui ne passe pas en 15 s → page à recharger.
-    let human = false, cfBid = false;
-    cfSince = 0;
-    for (const end = Date.now() + WAIT_MS; Date.now() < end;) {
+    // attente de la réponse du site : 45 s pour une mise envoyée ; dès qu'une vérification humaine ou un captcha
+    // Cloudflare apparaît, attente jusqu'à `deadline` que la page replace la mise une fois la vérification passée.
+    let human = false, cf = false;
+    const wait = Date.now() + WAIT_MS;
+    while (Date.now() < (human || cf ? deadline : wait)) {
       for (const r of bids.results.splice(0)) {
         if (r.status >= 200 && r.status < 300) return { ok: true, accepted: true };
-        if (r.cf) cfBid = true;
+        if (r.cf) cf = true;
         else if (isHuman(r.body)) human = true;
         else return { ok: false, error: `mise refusée par le site : ${(r.body && (r.body.error || r.body.message)) || 'erreur ' + r.status}` };
       }
-      cfSince = cfBid || await inPage(tabId, cloudflare) ? cfSince || Date.now() : 0;
-      if (cfSince && Date.now() - cfSince > CF_PASS_MS) return { cloudflare: true };
-      await bids.next(Math.min(1000, Math.max(0, end - Date.now())));
+      if (!cf && await inPage(tabId, cloudflare)) cf = true;
+      await bids.next(Math.min(1000, Math.max(0, (human || cf ? deadline : wait) - Date.now())));
     }
-    if (human) return { ok: true, human: true };
+    if (human || cf) return { ok: true, human: true, cloudflare: cf && !human };
     throw new Error('le clic n’a envoyé aucune mise au site en 45 s');
   } finally {
     bids.stop();
