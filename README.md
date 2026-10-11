@@ -22,6 +22,7 @@ Si Chrome le demande, active le « Mode développeur » dans `chrome://extension
 1. **Cartes voulues** : tape un nom, clique Chercher, puis Ajouter sur la bonne carte (badge « titre exact »). Tu peux fixer un prix max par carte, sinon c'est le prix max de sa rareté.
    - Les cartes que tu possèdes déjà sont surlignées en vert (« ✓ Possédée » avec leur rareté), les autres sont marquées « À trouver ».
    - Case **Affaire** : le bot n'achète cette carte que si c'est une bonne affaire, avec la même règle que le Trading.
+   - **Ne jamais surenchérir sur** (Options) : ajoute les pseudos de tes amis. Si l'un d'eux est en tête sur une carte voulue ou une carte d'une catégorie, le bot ne mise pas ; si une autre personne passe devant lui, le bot mise de nouveau. Le trading et les shiny ne sont pas concernés.
 2. **Réglages** : choisis ta **réserve protégée**, le solde que le bot ne fera jamais descendre.
 3. Clique **Démarrer**. Le rond qui tourne en haut du panneau montre que le bot est en ligne : vert en réel, jaune en simulation.
 4. Au début, le bot est en **simulation** : il écrit dans le journal ce qu'il ferait, sans rien dépenser. Quand ça te convient, désactive la simulation dans Réglages.
@@ -115,7 +116,7 @@ La défausse automatique par rareté épargne aussi les cartes de valeur.
 Réglages → **Copier mes réglages** : le bot crée un code `WMBOT1:…` à envoyer à un ami. De son côté, il colle le code puis clique **Importer**.
 
 - **Tout est transféré à l'identique** : trading, vente et tri, paquets, prix max par rareté, réserve, rythme, liste « À garder »…
-- **Sauf ce qui est personnel** : la liste des cartes voulues (chacun garde la sienne, même en important) et le mode simulation ou réel.
+- **Sauf ce qui est personnel** : la liste des cartes voulues et la liste d'amis (chacun garde les siennes, même en important), et le mode simulation ou réel.
 - Avant d'importer, le bot indique combien de réglages vont changer et demande confirmation. Après, il vérifie que chaque réglage a été repris exactement et le signale dans le Journal si ce n'est pas le cas.
 - Utilisez la même version du bot : si les versions diffèrent, un avertissement le signale.
 

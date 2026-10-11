@@ -46,6 +46,7 @@
       enabled: true,
       items: [],                                            // { title, max, notifyOver, tag }  (max vide = ancien prix max par rareté)
       categories: [],                                       // { name, max, mult, enabled } : toutes les cartes d'une catégorie (ex. « race de chien »)
+      friends: [],                                          // pseudos de tes amis : le bot ne surenchérit jamais sur eux (cartes voulues et catégories)
       defaultMax: { L: 500, UR: 150, SR: 60, R: 15, PC: 5, C: 3 },
       allowDuplicates: false,
       scanEveryMin: 10,
@@ -135,6 +136,7 @@
     c.wishlist.items = (c.wishlist.items || []).filter(i => i && i.title && String(i.title).trim()).map(({ dealOnly, ...i }) => i);   // option « Affaire » retirée en 1.8.5
     c.wishlist.categories = (c.wishlist.categories || []).filter(x => x && String(x.name || '').trim())
       .map(x => ({ name: String(x.name).trim(), tag: String(x.tag || '').trim() || null, exact: x.exact === true, max: Math.max(1, (x.max | 0) || 1000), mult: Math.min(10, Math.max(0.5, Number(x.mult) || 2)), enabled: x.enabled !== false }));
+    c.wishlist.friends = [...new Map((c.wishlist.friends || []).map(f => String(f || '').trim().replace(/^@/, '')).filter(Boolean).map(f => [f.toLowerCase(), f])).values()];   // sans doublon (majuscules ignorées)
     c.keepTitles = c.keepTitles || [];
     c.trading.manualRef = c.trading.manualRef || {};
     c.trading.maxBids = Math.max(1, c.trading.maxBids | 0);
@@ -185,13 +187,13 @@
   const loadConfig = () => sanitize(merge(DEFAULTS, load(K.config, {})));
 
   // ── Partage des réglages ──
-  // Tout est partagé sauf ce qui est personnel : la liste des cartes voulues et le mode simulation.
+  // Tout est partagé sauf ce qui est personnel : la liste des cartes voulues, la liste d'amis et le mode simulation.
   const SHARE_PREFIX = 'WMBOT1:';
   const BOT_VERSION = '2.10';
   function stripPersonal(c) {
     const o = JSON.parse(JSON.stringify(c || {}));
     delete o.dryRun;
-    if (o.wishlist) delete o.wishlist.items;
+    if (o.wishlist) { delete o.wishlist.items; delete o.wishlist.friends; }
     return o;
   }
   function makeShareCode() {
@@ -222,6 +224,7 @@
   function importSettings(settings, mine = loadConfig()) {
     const next = sanitize(merge(DEFAULTS, JSON.parse(JSON.stringify(settings))));
     next.wishlist.items = JSON.parse(JSON.stringify(mine.wishlist.items));
+    next.wishlist.friends = [...mine.wishlist.friends];
     next.dryRun = mine.dryRun;
     const a = flatten(stripPersonal(mine)), b = flatten(stripPersonal(next));
     const changed = [...new Set([...Object.keys(a), ...Object.keys(b)])].filter(k => a[k] !== b[k]).length;
@@ -537,6 +540,22 @@
   }
   const ownedRarities = title => (load(K.owned, { map: {} }).map[norm(title)] || []);
   const wishCap = (item, rarity) => item.max != null && item.max !== '' ? Number(item.max) : Number(config.wishlist.defaultMax[rarity] ?? 0);
+  // Amis : le bot ne surenchérit jamais sur eux, pour les cartes voulues et les catégories (pas le trading ni les shiny).
+  // Si une autre personne passe devant l'ami, le bot mise de nouveau. friendLead : pseudo de l'ami en tête, sinon null.
+  const friendKey = s => String(s || '').trim().replace(/^@/, '').toLowerCase();
+  const friendLead = a => {
+    const u = a && a.current_bidder && a.current_bidder.username;
+    return u && config.wishlist.friends.some(f => friendKey(f) === friendKey(u)) ? u : null;
+  };
+  const friendFor = (meta, a) => meta && (meta.source === 'wish' || meta.source === 'cat') ? friendLead(a) : null;
+  // Un ami prend la tête d'une enchère suivie, ou la perd : noté dans le suivi, et une seule fois au journal.
+  function noteFriend(id, meta, friend, price) {
+    if ((meta.friend || null) === (friend || null)) return;
+    if (friend) { meta.friend = friend; log('skip', `${meta.title} : ${friend} (ami) est en tête à ${price}, le bot ne surenchérit pas`, { auctionId: id }); }
+    else delete meta.friend;
+    const t = load(K.tracked, {})[id];
+    if (t) setTracked(id, { ...t, friend: meta.friend });
+  }
   const engaged = source => Object.values(tracked).filter(t => !source || t.source === source).reduce((s, t) => s + (t.leading ? t.lastBid : 0), 0);
 
   // ── Carte voulue au-dessus du seuil : c'est à l'utilisateur de décider (monter le seuil ou laisser tomber) ──
@@ -689,6 +708,8 @@
   // En cas d'échec, la raison est notée dans meta.refusal (pour le bilan du trading)
   async function placeBid(a, amount, meta, why, retried = false) {
     const refuse = reason => { meta.refusal = reason; return false; };
+    const friend = friendFor(meta, a);                     // dernier rempart : aucune mise sur une enchère menée par un ami
+    if (friend) return refuse(`${friend} (ami) est en tête`);
     if (humanFor('bids') && !takeProbe('bids')) return refuse('vérification humaine en attente');
     // solde connu de moins de 45 s : on évite une requête (précieux quand le site est lent)
     const bal = balance != null && Date.now() - balanceAt < 45000 ? balance : await getBalance();
@@ -704,7 +725,12 @@
       const msg = errOf(r);
       if (needsHuman(r)) { setHuman('bids', 'mise une fois à la main', r); return refuse('vérification humaine demandée'); }
       const min = /minimum\s+(\d+)/i.exec(msg);
-      if (min && !retried && Number(min[1]) <= meta.cap) return placeBid(a, Number(min[1]), meta, why + ' · relancée au nouveau minimum', true);
+      if (min && !retried && Number(min[1]) <= meta.cap) {
+        // quelqu'un vient de miser : avec des amis listés, l'enchère est relue pour ne pas surenchérir sur l'un d'eux
+        const cur = config.wishlist.friends.length && (meta.source === 'wish' || meta.source === 'cat') ? await getAuction(a.id) : a;
+        if (!cur) return refuse('enchère illisible après une surenchère');
+        return placeBid(cur, Number(min[1]), meta, why + ' · relancée au nouveau minimum', true);
+      }
       if (/termin/i.test(msg)) { log('skip', `Trop tard pour ${meta.title} : l’enchère était déjà terminée`); return refuse('terminée avant la mise'); }
       if (min) { log('skip', `${meta.title} : quelqu’un a surenchéri (minimum ${min[1]}, ton max ${meta.cap})`); return refuse('surenchérie juste avant'); }
       log('error', `Mise refusée sur ${meta.title} (${amount}) : ${msg}`);
@@ -713,7 +739,7 @@
     if (r.body && typeof r.body.bidder_balance === 'number') { balance = r.body.bidder_balance; balanceAt = Date.now(); }
     clearHuman('bids');              // la mise est passée : la vérification a été faite
     tracked = load(K.tracked, {});
-    tracked[a.id] = { ...meta, refusal: undefined, card_id: a.card_id, lastBid: amount, leading: true, end: a.end_at };
+    tracked[a.id] = { ...meta, refusal: undefined, friend: undefined, card_id: a.card_id, lastBid: amount, leading: true, end: a.end_at };
     save(K.tracked, tracked);
     log('bid', `Mise ${amount} sur ${meta.title} (${meta.rarity}), max ${meta.cap} · ${why}`, { auctionId: a.id });
     return true;
@@ -749,8 +775,8 @@
       const key = norm(item.title);
       const st = { at: Date.now(), count: 0, min: null, minRarity: null, minId: null, minEnd: null, status: 'none' };
       const mine = Object.values(tracked).find(t => norm(t.title) === key);
-      if (mine && !item.all) { info[key] = { ...(info[key] || {}), at: Date.now(), status: mine.leading ? 'leading' : 'bidding', detail: mine.lastBid }; continue; }
-      let leadingAlready = false, errors = 0, ownedSeen = 0, leadingN = 0;
+      if (mine && !item.all) { info[key] = { ...(info[key] || {}), at: Date.now(), status: mine.leading ? 'leading' : mine.friend ? 'friend' : 'bidding', detail: mine.lastBid, friend: (!mine.leading && mine.friend) || undefined }; continue; }
+      let leadingAlready = false, errors = 0, ownedSeen = 0, leadingN = 0, friendN = 0;
       const dup = config.wishlist.allowDuplicates || !!item.all;   // « tous les exemplaires » : les doublons comptent aussi
       const viable = [];
       const doneSorts = new Set(), seenIds = new Set();
@@ -764,7 +790,9 @@
           if (a.status !== 'active' || norm(titleOf(a.card)) !== key || leftMs(a.end_at) <= 0) continue;
           const rarity = rarityOf(a), amount = minNext(a);
           st.count++;
+          const friend = a.current_bidder_id === me ? null : friendLead(a);
           if (a.owned && !dup) { /* doublon : ne compte pas pour l'alerte de seuil */ }
+          else if (friend) { friendN++; st.friend = friend; st.friendBid = a.current_bid; }   // un ami est en tête : enchère laissée (ni mise, ni alerte de seuil)
           else if (st.min == null || amount < st.min) { st.min = amount; st.minRarity = rarity; st.minId = a.id; st.minEnd = a.end_at; }
           if (a.current_bidder_id === me) {
             if (!item.all) { leadingAlready = true; st.detail = a.current_bid; break; }
@@ -773,6 +801,7 @@
           if (item.all && tracked[a.id]) continue;               // déjà misée, dépassée : la surenchère s'en occupe
           let cap = wishCap(item, rarity);
           if (a.owned && !dup) { ownedSeen++; cap = 0; }
+          else if (friend) cap = 0;
           if (cap > 0 && amount <= cap) viable.push({ a, rarity, cap, amount });
         }
         await sleep(jitter(400));
@@ -797,10 +826,11 @@
       else if (leadingN) st.status = 'leading';
       else if (!st.count) st.status = errors ? 'error' : 'none';
       else if (ownedSeen === st.count) st.status = 'owned';
+      else if (friendN && ownedSeen + friendN === st.count) st.status = 'friend';   // rien d'autre en vente que des enchères menées par un ami
       else st.status = 'too_expensive';
       // au-dessus du seuil : alerte (pastille bleue) pour que l'utilisateur décide ; sinon l'alerte n'a plus lieu d'être
       if (st.status === 'too_expensive' && st.minId) raiseWishAlert(item, { price: st.min, rarity: st.minRarity, cap: wishCap(item, st.minRarity), auctionId: st.minId, end: st.minEnd });
-      else if (['bid', 'leading', 'owned', 'none'].includes(st.status)) clearWishAlert(item.title);
+      else if (['bid', 'leading', 'owned', 'none', 'friend'].includes(st.status)) clearWishAlert(item.title);
       info[key] = st;
       await snipeTick();
     }
@@ -812,7 +842,7 @@
     wishCursor = 0;
     const count = {};
     items.forEach(i => { const x = info[norm(i.title)]; if (x) count[x.status] = (count[x.status] || 0) + 1; });
-    const label = { bid: 'misée(s)', leading: 'en tête', bidding: 'dépassée(s)', too_expensive: 'trop chère(s)', none: 'pas en vente', owned: 'déjà possédée(s)', no_deal: 'pas une bonne affaire', no_slot: 'sans emplacement libre', error: 'recherche en échec', sim: 'simulée(s)', refused: 'refusée(s)' };
+    const label = { bid: 'misée(s)', leading: 'en tête', bidding: 'dépassée(s)', friend: 'laissée(s) à un ami', too_expensive: 'trop chère(s)', none: 'pas en vente', owned: 'déjà possédée(s)', no_deal: 'pas une bonne affaire', no_slot: 'sans emplacement libre', error: 'recherche en échec', sim: 'simulée(s)', refused: 'refusée(s)' };
     log('info', 'Cartes voulues : ' + (Object.entries(count).map(([k, n]) => `${n} ${label[k] || k}`).join(', ') || 'rien à signaler'));
     return true;
   }
@@ -866,6 +896,7 @@
         if (amount > cat.max) { why('au-dessus du max par carte'); continue; }
         if (a.seller_id === me) { why('ta propre vente'); continue; }
         if (a.current_bidder_id === me || busy.has(norm(titleOf(a.card)))) { why('déjà misée'); continue; }
+        if (friendLead(a)) { why('un ami est en tête'); continue; }
         if ((a.owned && (cat.exact || !config.wishlist.allowDuplicates)) || have.has(norm(titleOf(a.card)))) { why('déjà possédée'); continue; }
         const k = norm(titleOf(a.card)) + '|' + rarityOf(a);
         if (!best.has(k) || amount < best.get(k).amount) best.set(k, { a, amount });
@@ -926,6 +957,7 @@
       if (a.status !== 'active') { next.follow = 0; continue; }        // terminée : le suivi normal fait le bilan
       const lead = a.current_bidder_id === me;
       setTracked(id, { ...meta, leading: lead, current: a.current_bid, need: minNext(a), end: a.end_at, ...(lead && a.current_bid != null ? { lastBid: a.current_bid } : {}) });
+      noteFriend(id, meta, lead ? null : friendLead(a), a.current_bid);
     }
     return 'bid';
   }
@@ -933,6 +965,8 @@
   async function manualBid(item, auctionId, amount) {
     const a = await getAuction(auctionId);
     if (!a || a.status !== 'active' || leftMs(a.end_at) <= 0) return { ok: false, why: 'enchère terminée' };
+    const friend = friendLead(a);                          // avant de monter le max de la carte
+    if (friend) return { ok: false, why: `${friend} (ami) est en tête` };
     if (amount < minNext(a)) return { ok: false, why: `il faut au moins ${minNext(a)}` };
     const cfg = loadConfig(), it = cfg.wishlist.items.find(i => norm(i.title) === norm(item.title));
     if (it && !(Number(it.max) >= amount)) { it.max = amount; config = sanitize(cfg); saveConfig(); }
@@ -1331,7 +1365,10 @@
       soonest = Math.min(soonest, endMs);
       const leading = a.current_bidder_id === me;
       if (leading !== meta.leading || a.current_bid !== meta.current || a.end_at !== meta.end) { Object.assign(meta, { leading, current: a.current_bid, need: minNext(a), end: a.end_at }, leading && a.current_bid != null ? { lastBid: a.current_bid } : {}); setTracked(id, meta); }
-      if (leading) continue;
+      // un ami est en tête : ni surenchère ni abandon ; l'enchère reste suivie, et si une autre personne passe devant, le bot remise
+      const friend = leading ? null : friendFor(meta, a);
+      noteFriend(id, meta, friend, a.current_bid);
+      if (leading || friend) continue;
       const amount = minNext(a);
       if (amount > meta.cap) {
         log('lost', `Dépassé sur ${meta.title} : ${a.current_bid} (il faudrait ${amount}, ton max est ${meta.cap}) — abandon`, { auctionId: id });
@@ -1375,7 +1412,9 @@
         const lead = a.current_bidder_id === me;
         // fin prolongée, prix monté… : on note tout de suite, la fenêtre de surveillance suit la nouvelle fin
         setTracked(id, { ...cur, end: a.end_at, leading: lead, current: a.current_bid, need: minNext(a), ...(lead && a.current_bid != null ? { lastBid: a.current_bid } : {}) });
-        if (lead) return;
+        const friend = lead ? null : friendFor(cur, a);
+        noteFriend(id, cur, friend, a.current_bid);
+        if (lead || friend) return;                               // en tête, ou un ami l'est : pas de surenchère
         const amount = minNext(a);
         if (amount > cur.cap) {
           if (cur.source === 'wish') raiseWishAlert(wishFor(cur.title), { price: amount, rarity: cur.rarity, cap: cur.cap, auctionId: id, end: a.end_at });
@@ -3057,6 +3096,7 @@
       const line = ([id, t], k) => {
         const refresh = k ? '' : refreshBtn;                 // ↻ une seule fois, sur la première ligne
         if (t.leading) return `<div class="wbidl"><span>Ta mise <b>${t.current != null ? t.current : t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="good">✓ en tête</span>${left(t.end)}<span class="wsp"></span>${refresh}</div>`;
+        if (t.friend) return `<div class="wbidl"><span>Ta mise <b>${t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="warn">🤝 ${esc(t.friend)} en tête${t.current != null ? ' (' + t.current + ')' : ''}</span>${left(t.end)}<span class="wsp"></span>${refresh}</div>`;
         const need = t.need || (t.current != null ? Math.max(t.current + 1, Math.ceil(t.current * 1.1)) : t.lastBid + 1);
         return `<div class="wbidl"><span>Ta mise <b>${t.lastBid}</b> <b class="r-${t.rarity}">${t.rarity}</b></span><span class="bad">✗ dépassé${t.current != null ? ' (' + t.current + ')' : ''}</span>${left(t.end)}<span class="wsp"></span>${bid(id, need, 'Surenchérir')}${refresh}</div>`;
       };
@@ -3065,7 +3105,7 @@
     if (al) return `<div class="wbidl"><span class="bad">✗ dépassé : il faut <b>${al.price}</b> <b class="r-${al.rarity}">${al.rarity}</b></span>${left(al.end)}<span class="wsp"></span>${bid(al.auctionId, al.price, 'Surenchérir')}<button class="wbtn ghost" data-a="dropAlert" data-n="${n}" title="Laisser tomber cette enchère">Ignorer</button>${refresh}</div>`;
     if (x && x.minId && ['too_expensive', 'no_slot', 'sim', 'refused'].includes(x.status))
       return `<div class="wbidl"><span class="muted">Pas de mise · en vente dès <b>${x.min}</b> <b class="r-${x.minRarity}">${x.minRarity}</b></span>${left(x.minEnd)}<span class="wsp"></span>${bid(x.minId, x.min, 'Miser')}${refresh}</div>`;
-    return `<div class="wbidl"><span class="muted">${x ? (x.status === 'owned' ? 'Déjà possédée' : x.status === 'error' ? 'Site muet' : 'Pas en vente') : 'Pas encore cherchée'}${x ? ` · ${Math.max(0, Math.round((Date.now() - x.at) / 60000))} min` : ''}</span><span class="wsp"></span>${refresh}</div>`;
+    return `<div class="wbidl"><span class="muted">${x ? (x.status === 'owned' ? 'Déjà possédée' : x.status === 'error' ? 'Site muet' : x.status === 'friend' ? `🤝 ${esc(x.friend)} en tête${x.friendBid != null ? ' (' + x.friendBid + ')' : ''}` : 'Pas en vente') : 'Pas encore cherchée'}${x ? ` · ${Math.max(0, Math.round((Date.now() - x.at) / 60000))} min` : ''}</span><span class="wsp"></span>${refresh}</div>`;
   }
   // État d'une catégorie : dernière recherche, mises en cours, raisons des cartes écartées
   function catStatus(c) {
@@ -3073,7 +3113,7 @@
     const live = Object.values(load(K.tracked, {})).filter(t => t.source === 'cat' && norm(t.cat || '') === norm(c.name));
     const cur = live.length ? `<div class="cbs">${live.sort((a, b) => new Date(a.end) - new Date(b.end)).map(t => `<div class="cb">
         <b class="r-${t.rarity}">${t.rarity}</b><span class="cbt" title="${esc(t.title)}">${esc(t.title)}</span>
-        ${t.leading ? '<span class="cbs-on">en tête</span>' : '<span class="cbs-off">dépassé</span>'}
+        ${t.leading ? '<span class="cbs-on">en tête</span>' : t.friend ? `<span class="cbs-off">🤝 ${esc(t.friend)}</span>` : '<span class="cbs-off">dépassé</span>'}
         <b>${t.lastBid}</b><span class="muted">max ${t.cap}</span><span class="muted">⏱ ${fmtLeft(leftMs(t.end))}</span></div>`).join('')}</div>` : '';
     if (!x) return cur + '<span class="muted">Pas encore cherchée.</span>';
     const ago = Math.round((Date.now() - x.at) / 60000);
@@ -3081,6 +3121,9 @@
     const why = Object.entries(x.why).map(([r, n]) => `${n} ${esc(r)}`).join(', ');
     return `${cur}<span class="muted">${ago < 1 ? 'à l’instant' : 'il y a ' + ago + ' min'} · ${x.match} en vente dans la catégorie</span>${x.bids.length ? `<br>${x.bids.some(b => b.sim) ? '🧪 Miserait' : 'Nouvelles mises'} : ${bids}` : ''}${why ? `<br><span class="muted">Écartées : ${why}</span>` : ''}`;
   }
+  // Amis : pseudos sur lesquels le bot ne surenchérit jamais (cartes voulues et catégories)
+  const tplFriends = w => `${row('Ne jamais surenchérir sur', 'pseudos de tes amis', '<span class="search"><input type="text" data-v="friend" placeholder="pseudo" style="width:120px"><button data-a="friendAdd">Ajouter</button></span>')}
+        ${w.friends.length ? `<div class="chips">${w.friends.map((f, n) => `<span class="chip on" style="cursor:default;padding-right:2px">🤝 ${esc(f)}<button class="ghost" data-a="friendDel" data-n="${n}" title="Retirer de la liste">✕</button></span>`).join('')}</div>` : ''}`;
   function tplCat() {
     const w = config.wishlist;
     return `
@@ -3113,6 +3156,7 @@
       </div>
       <div class="card"><h3>Options</h3>
         ${row('Accepter une carte que j’ai déjà', 'Sinon le bot ignore les doublons', sw('wishlist.allowDuplicates', w.allowDuplicates))}
+        ${tplFriends(w)}
         ${row('Chercher toutes les', 'minutes (cartes et catégories)', num('wishlist.scanEveryMin', w.scanEveryMin, 'min="3"'))}
       </div>`;
   }
@@ -3148,6 +3192,7 @@
       </div>
       <div class="card"><h3>Options</h3>
         ${row('Accepter une carte que j’ai déjà', 'Sinon le bot ignore les doublons', sw('wishlist.allowDuplicates', w.allowDuplicates))}
+        ${tplFriends(w)}
         ${row('Chercher toutes les', 'minutes', num('wishlist.scanEveryMin', w.scanEveryMin, 'min="3"'))}
       </div>`;
   }
@@ -3426,7 +3471,7 @@
       <div class="card"><h3>Partager mes réglages</h3>
         <p class="help"><b>Copier mes réglages</b> crée un code à envoyer à un ami. Pour importer ceux d’un ami, colle son code ci-dessous puis clique « Importer ».</p>
         <p class="help">Tout est partagé : trading, vente et tri, paquets, prix max par rareté, réserve, rythme, liste « À garder »…<br>
-        Sauf ce qui est personnel : <b>ta liste de cartes voulues</b> (chacun garde la sienne, même en important) et <b>le mode simulation</b>.</p>
+        Sauf ce qui est personnel : <b>ta liste de cartes voulues</b> et <b>ta liste d’amis</b> (chacun garde les siennes, même en important), et <b>le mode simulation</b>.</p>
         <textarea data-v="cfgio" placeholder="Colle ici le code WMBOT1:… d’un ami"></textarea>
         <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><button data-a="exportCfg">Copier mes réglages</button><button data-a="importCfg">Importer</button><button class="danger" data-a="resetCfg">Tout réinitialiser</button></div>
       </div>
@@ -3695,6 +3740,7 @@
       ev.stopPropagation();
       if (t === 'keydown' && ev.key === 'Enter' && ev.target.dataset && ev.target.dataset.v === 'q') root.querySelector('[data-a="search"]').click();
       if (t === 'keydown' && ev.key === 'Enter' && ev.target.dataset && ev.target.dataset.v === 'stkq') root.querySelector('[data-a="stkFind"]').click();
+      if (t === 'keydown' && ev.key === 'Enter' && ev.target.dataset && ev.target.dataset.v === 'friend') root.querySelector('[data-a="friendAdd"]').click();
     }));
 
     async function doSearch(btn) {
@@ -4030,6 +4076,20 @@
         config.wishlist.categories.push({ name, tag, exact, max: max > 0 ? max : 1000, mult: mult > 0 ? mult : 2, enabled: true });
         commit(`Catégorie « ${name} » ajoutée`); catQueue = name; next.cat = 0; renderTab('wish'); return;
       }
+      if (a === 'friendAdd') {
+        const name = ($('friend').value || '').trim().replace(/^@/, '');
+        if (!name) return;
+        config = loadConfig();
+        if (config.wishlist.friends.some(f => friendKey(f) === friendKey(name))) { toast('Déjà dans la liste'); return; }
+        config.wishlist.friends.push(name);
+        commit(`Plus de surenchère sur ${name}`); next.follow = 0; renderTab('wish'); return;
+      }
+      if (a === 'friendDel') {
+        config = loadConfig();
+        const [gone] = config.wishlist.friends.splice(Number(btn.dataset.n), 1);
+        if (gone) { commit(`${gone} retiré de la liste`); next.follow = 0; next.wish = 0; next.cat = 0; }
+        renderTab('wish'); return;
+      }
       if (a === 'catDel') { config = loadConfig(); const c = config.wishlist.categories.splice(Number(btn.dataset.n), 1)[0]; if (c) commit(`Catégorie « ${c.name} » retirée`); renderTab('wish'); return; }
       if (a === 'catRun') {
         const c = config.wishlist.categories[Number(btn.dataset.n)];
@@ -4086,7 +4146,7 @@
         const tr = Object.values(load(K.tracked, {}));
         put(v('bids'), tr.length); put(v('sales'), Object.keys(load(K.listings, {})).length);
         put(v('upcoming'), running ? upcoming().map(u => `<div><time>${fmtLeft(u.at - Date.now())}</time>${u.label}</div>`).join('') : '<div class="muted">Le bot est arrêté.</div>');
-        put(v('tracked'), tr.length ? tr.map(t => `<div><b class="r-${t.rarity}">${t.rarity}</b> ${esc(t.title)} · ${t.leading ? '<span class="good">tu mènes</span>' : '<span class="warn">dépassé</span>'} à ${t.lastBid} · max ${t.cap} · fin ${fmtLeft(leftMs(t.end))} <span class="muted">${t.source === 'trade' ? '· trading' : t.source === 'cat' ? `· catégorie « ${esc(t.cat)} »` : ''}</span></div>`).join('') : '<div class="muted">Aucune.</div>');
+        put(v('tracked'), tr.length ? tr.map(t => `<div><b class="r-${t.rarity}">${t.rarity}</b> ${esc(t.title)} · ${t.leading ? '<span class="good">tu mènes</span>' : t.friend ? `<span class="warn">🤝 ${esc(t.friend)} en tête</span> · toi` : '<span class="warn">dépassé</span>'} à ${t.lastBid} · max ${t.cap} · fin ${fmtLeft(leftMs(t.end))} <span class="muted">${t.source === 'trade' ? '· trading' : t.source === 'cat' ? `· catégorie « ${esc(t.cat)} »` : ''}</span></div>`).join('') : '<div class="muted">Aucune.</div>');
         put(v('recent'), load(K.journal, []).slice(-6).reverse().map(logLine).join('') || '<div class="muted">Rien pour l’instant.</div>');
         if (v('shiny')) put(v('shiny'), shinyHomeHtml());
         // Pauses du site : toujours affichées ici avec leur bouton, même si la notification « À toi de jouer » a été masquée (✕).
