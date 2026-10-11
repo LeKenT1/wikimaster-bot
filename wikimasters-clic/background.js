@@ -21,6 +21,12 @@
 // Chrome réduit (un seul écran, un jeu par-dessus…) : la page fait 0 × 0 pixel et rien n'est cliquable. Le temps du
 // clic, l'extension lui donne une taille virtuelle (Emulation, v1.2) : la fenêtre reste réduite, rien ne passe au premier
 // plan, aucun Alt+Tab.
+//
+// Mise plafonnée (v1.5) : le bot ne vise plus une page fixe, il choisit à chaque blocage une enchère à petit prix et
+// envoie avec elle un maximum (`max`). Juste avant de cliquer, l'extension lit le montant que la page s'apprête à miser
+// (le champ numérique à côté du bouton) : illisible ou au-dessus du maximum → aucun clic, { ok: false, error }. Le
+// montant réellement envoyé au site revient dans la réponse (`amount`). L'enchère changeant à chaque essai, tous les
+// onglets d'enchère laissés ouverts par les essais précédents sont refermés avant d'en ouvrir un nouveau.
 
 const SITE = 'https://www.wiki-masters.com/';
 const WAIT_MS = 45000;        // délai pour que le clic envoie une mise (sans vérification ni captcha en route)
@@ -53,7 +59,11 @@ function findButton(text) {
     top.dataset.wmclickHidden = '1';
     top = document.elementFromPoint(x, y);
   }
-  return { x, y, vw: innerWidth, disabled: btn.disabled, clear: !!top && (top === btn || btn.contains(top)) };
+  // montant que la page s'apprête à miser : le champ numérique le plus proche du bouton
+  let field = null;
+  for (let box = btn.parentElement, i = 0; box && !field && i < 4; box = box.parentElement, i++) field = box.querySelector('input[type="number"]');
+  const amount = field && field.value.trim() !== '' && isFinite(field.value) ? Number(field.value) : null;
+  return { x, y, vw: innerWidth, disabled: btn.disabled, clear: !!top && (top === btn || btn.contains(top)), amount };
 }
 function restorePage() {
   document.querySelectorAll('[data-wmclick-hidden]').forEach(e => { e.style.removeProperty('visibility'); delete e.dataset.wmclickHidden; });
@@ -74,11 +84,15 @@ async function inPage(tabId, func, ...args) {
 
 // Réponses du site aux mises (POST …/bid) dans cet onglet, lues par le protocole de débogage (domaine Network).
 function watchBids(tabId) {
-  const pending = new Map(), results = [];
+  const pending = new Map(), sent = new Map(), results = [];
   let wake = null;
+  const isBid = url => /\/bid(\?|$)/.test(new URL(url).pathname + '?');
   const onEvent = async (src, method, p) => {
     if (src.tabId !== tabId) return;
-    if (method === 'Network.responseReceived' && /\/bid(\?|$)/.test(new URL(p.response.url).pathname + '?') && p.type !== 'Preflight') {
+    if (method === 'Network.requestWillBeSent' && p.request.method === 'POST' && isBid(p.request.url)) {
+      try { const a = Number(JSON.parse(p.request.postData).amount); if (isFinite(a)) sent.set(p.requestId, a); } catch {}   // montant envoyé au site
+    }
+    if (method === 'Network.responseReceived' && isBid(p.response.url) && p.type !== 'Preflight') {
       const cf = Object.keys(p.response.headers || {}).some(h => h.toLowerCase() === 'cf-mitigated');   // mise arrêtée par Cloudflare
       pending.set(p.requestId, { status: p.response.status, cf });
     }
@@ -89,7 +103,7 @@ function watchBids(tabId) {
       if (method === 'Network.loadingFinished') {
         try { const r = await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: p.requestId }); body = JSON.parse(r.body); } catch {}
       }
-      results.push({ status, body, cf });
+      results.push({ status, body, cf, amount: sent.get(p.requestId) ?? null });
       if (wake) wake();
     }
   };
@@ -102,9 +116,10 @@ function watchBids(tabId) {
 }
 const isHuman = b => !!b && (b.code === 'human_verification_required' || b.human_verification_required === true || /v[ée]rification/i.test(String(b.error || b.message || '')));
 
-async function clickButton({ url, text }, from) {
+async function clickButton({ url, text, max }, from) {
   if (typeof url !== 'string' || !url.startsWith(SITE)) throw new Error('adresse refusée (seulement wiki-masters.com) : ' + url);
   if (!text) throw new Error('texte du bouton manquant');
+  if (max != null && !(typeof max === 'number' && max > 0)) throw new Error('mise maximale illisible : ' + max);
   const target = new URL(url);
   const same = !!from.url && new URL(from.url).pathname === target.pathname;
   const [before] = await chrome.tabs.query({ active: true, windowId: from.windowId });   // l'onglet où tu étais
@@ -112,13 +127,14 @@ async function clickButton({ url, text }, from) {
   if (same) await chrome.tabs.update(tabId, { active: true });
   else {
     target.hash = 'wmclick';
-    // onglet resté ouvert par l'essai précédent (vérification pas passée) : refermé, la page repart d'un onglet neuf
-    for (const t of await chrome.tabs.query({ url: SITE + '*' })) if (t.url === target.href) await chrome.tabs.remove(t.id).catch(() => {});
+    // onglets d'enchère restés ouverts par les essais précédents (vérification pas passée), quelle que soit l'enchère :
+    // refermés, la page repart d'un onglet neuf
+    for (const t of await chrome.tabs.query({ url: SITE + 'marketplace/*' })) if (t.id !== from.id && t.url.endsWith('#wmclick')) await chrome.tabs.remove(t.id).catch(() => {});
     const t = await chrome.tabs.create({ url: target.href, active: true, openerTabId: from.id, windowId: from.windowId, index: from.index + 1 });
     tabId = t.id; opened = true;
   }
   try {
-    const r = await clickOnce(tabId, text, url, Date.now() + BUDGET_MS);
+    const r = await clickOnce(tabId, text, url, Date.now() + BUDGET_MS, max);
     if (r.human) keep = true;
     return r;
   } finally {
@@ -128,8 +144,9 @@ async function clickButton({ url, text }, from) {
 }
 
 // Attend le bouton, clique, lit la réponse du site. Captcha ou vérification humaine en route : attente jusqu'à
-// `deadline`, sans recharger (la page replace la mise d'elle-même une fois passés).
-async function clickOnce(tabId, text, url, deadline) {
+// `deadline`, sans recharger (la page replace la mise d'elle-même une fois passés). `max` : aucun clic si la page
+// s'apprête à miser plus.
+async function clickOnce(tabId, text, url, deadline, max) {
   let spot = null, cf = false;
   for (const end = Date.now() + 25000; !spot && Date.now() < (cf ? deadline : end);) {
     if (await inPage(tabId, cloudflare)) cf = true;   // page « Un instant… » : on la laisse passer
@@ -151,6 +168,8 @@ async function clickOnce(tabId, text, url, deadline) {
     if (!spot) throw new Error(`bouton « ${text} » disparu`);
     if (!spot.clear) throw new Error(`bouton « ${text} » recouvert par un autre élément`);
     if (spot.disabled) throw new Error(`bouton « ${text} » grisé`);
+    if (max != null && spot.amount == null) throw new Error('montant de la mise illisible sur la page : aucun clic');
+    if (max != null && spot.amount > max) throw new Error(`la page propose une mise de ${spot.amount}, au-dessus du maximum de ${max} : aucun clic`);
     const mouse = (type, extra = {}) => chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type, x: spot.x, y: spot.y, ...extra });
     await mouse('mouseMoved');
     await mouse('mousePressed', { button: 'left', buttons: 1, clickCount: 1 });
@@ -162,7 +181,7 @@ async function clickOnce(tabId, text, url, deadline) {
     const wait = Date.now() + WAIT_MS;
     while (Date.now() < (human || cf ? deadline : wait)) {
       for (const r of bids.results.splice(0)) {
-        if (r.status >= 200 && r.status < 300) return { ok: true, accepted: true };
+        if (r.status >= 200 && r.status < 300) return { ok: true, accepted: true, amount: r.amount ?? spot.amount };
         if (r.cf) cf = true;
         else if (isHuman(r.body)) human = true;
         else return { ok: false, error: `mise refusée par le site : ${(r.body && (r.body.error || r.body.message)) || 'erreur ' + r.status}` };

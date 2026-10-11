@@ -41,7 +41,7 @@
     maxActiveBids: 10,     // enchères où l'on mise en même temps (limite choisie par l'utilisateur)
     packs: { enabled: true },
     notify: { off: false, blocks: true, packs: false, sales: false, shiny: true, phone: '' },  // notifications du navigateur : tout couper, blocages, paquets ouverts, mises en vente, nouvelles shiny ; phone = sujet ntfy (aussi sur le téléphone)
-    unblock: { on: true, url: 'https://www.wiki-masters.com/marketplace/8352790b-eff8-470e-ae82-d8fe54c2cf87', button: 'Miser' },  // déblocage par l'extension WikiMasters Clic : page à ouvrir, texte du bouton à cliquer
+    unblock: { on: true, max: 50, button: 'Miser' },       // déblocage par l'extension WikiMasters Clic : mise maximale sur l'enchère choisie par le bot, texte du bouton à cliquer
     wishlist: {
       enabled: true,
       items: [],                                            // { title, max, notifyOver, tag }  (max vide = ancien prix max par rareté)
@@ -162,8 +162,8 @@
     c.trading.liquidateFloor = Math.min(100, Math.max(0, c.trading.liquidateFloor | 0));
     c.trading.abandonAfter = Math.max(c.trading.liquidateAfter + 1, c.trading.abandonAfter | 0);
     c.trading.liqAdd = Number.isFinite(Number(c.trading.liqAdd)) ? Math.round(Number(c.trading.liqAdd)) : 1;
-    c.unblock.url = String(c.unblock.url || '').trim();
-    if (!c.unblock.url.startsWith('https://www.wiki-masters.com/')) c.unblock.url = '';   // l'extension ne clique que sur wiki-masters.com
+    delete c.unblock.url;                                  // page fixe d'avant la v2 : le bot choisit maintenant l'enchère lui-même
+    c.unblock.max = Math.max(1, (c.unblock.max | 0) || 50);
     c.unblock.button = String(c.unblock.button || '').trim() || 'Miser';
     if (!['normal', 'turbo', 'slow'].includes(c.mode)) c.mode = 'normal';
     c.slowUntil = c.mode === 'slow' ? Math.max(0, Number(c.slowUntil) || 0) : 0;
@@ -193,6 +193,7 @@
   function stripPersonal(c) {
     const o = JSON.parse(JSON.stringify(c || {}));
     delete o.dryRun;
+    if (o.unblock) delete o.unblock.url;                   // page fixe d'avant la v2 (code de partage d'une ancienne version)
     if (o.wishlist) { delete o.wishlist.items; delete o.wishlist.friends; }
     return o;
   }
@@ -2747,8 +2748,8 @@
 
   // ── Déblocage par l'extension « WikiMasters Clic » (v2.10 / v3.2) ──
   // Pour le site, un clic fait par un script de la page n'est pas un vrai clic (isTrusted = false). L'extension, elle, clique
-  // comme une souris. Sur un blocage, le bot lui demande d'ouvrir la page réglée et d'y cliquer le bouton (« Miser ») : c'est
-  // ce que faisait la macro UI Vision en surveillant l'encadré. La case « Vérifiez que vous êtes humain » reste à cocher à la main.
+  // comme une souris. Sur un blocage, le bot choisit une enchère légendaire à petit prix (pickUnblock) et lui demande d'ouvrir
+  // sa page et d'y cliquer le bouton (« Miser »). La case « Vérifiez que vous êtes humain » reste à cocher à la main.
   // Bot ⇄ extension : window.postMessage, relayé par le script de contenu de l'extension (dossier wikimasters-clic).
   const CLICK_RETRY_MS = 60000, CLICK_SLOW_MS = 15 * 60000, CLICK_MAX = 2, CLICK_HUMAN_MS = 30 * 60000;
   // clickStreak : essais depuis la dernière action acceptée par le site. Un essai raté → nouvel essai 1 min plus tard ;
@@ -2756,7 +2757,9 @@
   // vraie mise). clickHuman : vérification humaine toujours pas passée après le dernier essai, l'onglet de l'enchère est
   // resté ouvert pour toi ; pas de nouveau clic avant 30 min ou avant une action acceptée.
   let clickExt = null, clickBusy = false, clickNext = 0, clickLastAt = 0, clickStreak = 0, clickHuman = false;
-  const clickReady = () => !!clickExt && config.unblock.on && !!config.unblock.url && !config.dryRun;   // jamais en simulation : le clic est réel
+  // extension 1.5 au moins : c'est elle qui vérifie, juste avant de cliquer, que la page ne mise pas plus que « Mise max »
+  const clickCurrent = () => { const [a, b] = String(clickExt || '').split('.').map(Number); return a > 1 || (a === 1 && b >= 5); };
+  const clickReady = () => clickCurrent() && config.unblock.on && !config.dryRun;   // jamais en simulation : le clic est réel
   const clickHandles = () => clickReady() && !clickHuman;                                             // l'extension s'occupe des blocages
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || !e.data.wmclickHello) return;
@@ -2772,7 +2775,7 @@
       const on = e => { if (e.source === window && e.data && e.data.wmclickReply && e.data.wmclickReply.id === id) done(e.data.wmclickReply); };
       const to = setTimeout(() => done({ ok: false, error: 'pas de réponse de l’extension en 300 s' }), 300000);   // l’extension attend jusqu’à 280 s qu’un captcha passe de lui-même
       window.addEventListener('message', on);
-      window.postMessage({ wmclick: { id, url: req.url, text: req.text } }, '*');
+      window.postMessage({ wmclick: { id, url: req.url, text: req.text, max: req.max } }, '*');
     });
   }
   // Une seule notification du navigateur pour tout le déblocage (même tag, remplacée sur place) : « en cours », décompte
@@ -2798,10 +2801,40 @@
     tick(); verifT = setInterval(tick, 1000);
   }
 
-  // key : l'activité bloquée ; test = true : clic demandé depuis les Réglages, sans blocage ni attente
-  async function unblockByClick(key, test = false) {
+  // Enchère de déblocage (v2). Plus de page fixe où miser en boucle : à chaque blocage, le bot lit les légendaires les
+  // plus récentes du marché et prend celle dont la prochaine mise est la plus basse, jamais au-dessus de « Mise max ».
+  // La carte n'est pas voulue : la mise ne sert qu'à lever le blocage, et sur une enchère toute neuve elle est presque
+  // toujours dépassée ensuite. Le bot ne suit pas cette enchère et n'y remise pas. Écartées : tes ventes, les enchères
+  // où tu mènes ou que le bot suit, celles menées par un ami, celles qui finissent dans moins de 2 min, celles déjà
+  // essayées depuis moins de 30 min. À prix égal : celle qui finit le plus tard. La page suivante du marché n'est lue
+  // que si la précédente n'a rien donné.
+  const UNBLOCK_PAGES = 3, UNBLOCK_MIN_LEFT_MS = 2 * 60000, UNBLOCK_AGAIN_MS = 30 * 60000;
+  const unblockTried = new Map();                          // enchère → heure du dernier essai
+  async function pickUnblock() {
+    const max = config.unblock.max, me = await whoAmI(), followed = load(K.tracked, {});
+    for (const [id, at] of unblockTried) if (Date.now() - at > UNBLOCK_AGAIN_MS) unblockTried.delete(id);
+    let best = null, seen = 0;
+    for (let page = 1; page <= UNBLOCK_PAGES && !best; page++) {
+      const res = await searchMarket({ sort: 'recent', page, rarities: ['L'], retries: 1 });
+      if (!res) { if (!seen) return { error: 'marché illisible' }; break; }
+      for (const a of res.auctions || []) {
+        seen++;
+        const price = minNext(a), left = leftMs(a.end_at);
+        if (a.status !== 'active' || rarityOf(a) !== 'L' || !(price >= 1) || price > max || left < UNBLOCK_MIN_LEFT_MS) continue;
+        if (balance != null && price > balance) continue;
+        if ((me && (a.seller_id === me || a.current_bidder_id === me)) || followed[a.id] || unblockTried.has(a.id) || friendLead(a)) continue;
+        if (!best || price < best.price || (price === best.price && left > best.left)) best = { a, price, left };
+      }
+      if (!res.hasMore) break;
+    }
+    return best || { error: `aucune légendaire à ${max} ou moins parmi les ${seen} plus récentes` };
+  }
+
+  // key : l'activité bloquée ; test = true : clic demandé depuis les Réglages, sans blocage ni attente, sur l'enchère `pick`
+  async function unblockByClick(key, test = false, pick = null) {
     const u = config.unblock;
     if (!clickExt) return { ok: false, error: 'extension WikiMasters Clic absente de ce navigateur' };
+    if (!clickCurrent()) return { ok: false, error: `extension WikiMasters Clic ${clickExt} trop ancienne : installe la 1.5` };
     if (!test) {
       if (!clickReady() || Date.now() < clickNext) return null;
       clickHuman = false;                                      // 30 min après une demande de vérification : nouvel essai
@@ -2812,12 +2845,15 @@
     if (!test) {
       clickStreak++; clickLastAt = Date.now();
       clickNext = Date.now() + CLICK_SLOW_MS;                   // recalculé selon le résultat
-      log('info', `${HUMAN_NAMES[key] || key} bloquées : l’extension clique « ${u.button} » sur ${u.url} (essai ${clickStreak})`);
       verifStop();
       verifNotify(`${HUMAN_NAMES[key] || key} bloquées : vérification en cours…${clickStreak > 1 ? ` (essai ${clickStreak})` : ''}`, clickStreak <= CLICK_MAX);
     }
     try {
-      const r = await askClick({ url: u.url, text: u.button });
+      if (!pick) pick = await pickUnblock();
+      const title = pick.a ? `${titleOf(pick.a.card)} (L)` : '';
+      if (pick.a) unblockTried.set(pick.a.id, Date.now());
+      if (pick.a && !test) log('info', `${HUMAN_NAMES[key] || key} bloquées : l’extension clique « ${u.button} » sur ${title}, mise de ${pick.price} (essai ${clickStreak})`, { auctionId: pick.a.id });
+      const r = pick.a ? await askClick({ url: location.origin + '/marketplace/' + pick.a.id, text: u.button, max: u.max }) : { ok: false, error: pick.error };
       if (!r.ok || r.human) {
         const why = !r.ok ? r.error
           : r.cloudflare ? 'captcha Cloudflare pas passé de lui-même en plus de 4 min'
@@ -2841,7 +2877,8 @@
       } else {
         verifStop(true);                                         // vérification passée : notification retirée
         if (r.accepted) {
-          log('info', `Déblocage par clic : mise acceptée par le site, blocage levé`);
+          log('info', `Déblocage par clic : mise de ${r.amount ?? pick.price} acceptée sur ${title}, blocage levé`, { auctionId: pick.a.id });
+          next.balance = 0;                                    // une vraie mise vient de partir : solde relu au prochain tour
           if (key) clearHuman(key);                            // mise acceptée par le site : la pause se lève, le bot reprend
         } else {                                                 // extension 1.0 : résultat inconnu
           log('info', `Déblocage par clic : « ${u.button} » cliqué (extension 1.0 : le résultat n’est pas vérifié, mets-la à jour)`);
@@ -3461,12 +3498,12 @@
         <p class="help">Les cartes voulues qui dépassent leur seuil te préviennent selon la case cochée à leur ajout.</p>
       </div>
       <div class="card"><h3>🖱 Déblocage automatique</h3>
-        <p class="help">${clickExt ? `Extension <b>WikiMasters Clic</b> ${esc(clickExt)} détectée.` : 'Extension <b>WikiMasters Clic</b> absente de ce navigateur : sans elle, rien ne se passe.'}
-        Quand le site bloque, elle ouvre la page ci-dessous et y clique le bouton comme une vraie souris (plus besoin d’UI Vision). L’extension lit la réponse du site : si le site demande une vérification humaine, l’onglet de l’enchère reste ouvert pour toi, et la mise se place toute seule une fois la vérification faite.</p>
+        <p class="help">${clickExt ? `Extension <b>WikiMasters Clic</b> ${esc(clickExt)} ${clickCurrent() ? 'détectée' : ': trop ancienne, installe la 1.5'}.` : 'Extension <b>WikiMasters Clic</b> absente de ce navigateur : sans elle, rien ne se passe.'}
+        Quand le site bloque, elle mise sur la légendaire la moins chère parmi les plus récentes du marché.</p>
         ${row('Débloquer tout seul', 'un clic toutes les 2 min tant que ça bloque, toutes les 15 min après 3 essais sans effet · si le site demande une vérification humaine, l’onglet reste ouvert pour toi · jamais en simulation', sw('unblock.on', c.unblock.on))}
-        ${row('Page', 'une page de wiki-masters.com qui affiche le bouton', `<input type="text" data-k="unblock.url" value="${esc(c.unblock.url)}" style="width:200px">`)}
+        ${row('Mise max', '', num('unblock.max', c.unblock.max, 'min="1"'))}
         ${row('Bouton', 'son texte exact', `<input type="text" data-k="unblock.button" value="${esc(c.unblock.button)}" style="width:90px">`)}
-        <div class="stkbar"><button data-a="clickTest" ${clickExt ? '' : 'disabled'}>Tester maintenant</button></div>
+        <div class="stkbar"><button data-a="clickTest" ${clickCurrent() ? '' : 'disabled'}>Tester maintenant</button></div>
       </div>
       <div class="card"><h3>Partager mes réglages</h3>
         <p class="help"><b>Copier mes réglages</b> crée un code à envoyer à un ami. Pour importer ceux d’un ami, colle son code ci-dessous puis clique « Importer ».</p>
@@ -4001,10 +4038,13 @@
         commit('Nom généré : abonne-toi à ' + config.notify.phone + ' dans l’appli ntfy'); renderTab(); return;
       }
       if (a === 'clickTest') {
-        if (!(await ask(`L’extension va ouvrir ${config.unblock.url || '(aucune page réglée)'} et cliquer vraiment sur « ${config.unblock.button} ». Continuer ?`))) return;
         btn.disabled = true;
-        const r = await unblockByClick(null, true);
-        toast(r.ok ? (r.human ? 'Clic fait : une case « Vérifiez que vous êtes humain » est à cocher' : 'Clic fait ✓') : 'Échec : ' + r.error, 6000);
+        const pick = await pickUnblock();
+        if (!pick.a) toast('Échec : ' + pick.error, 6000);
+        else if (await ask(`L’extension va miser ${pick.price} pour de vrai sur « ${titleOf(pick.a.card)} » (légendaire). Continuer ?`)) {
+          const r = await unblockByClick(null, true, pick);
+          toast(r.ok ? (r.human ? 'Clic fait : une case « Vérifiez que vous êtes humain » est à cocher' : `Mise de ${r.amount ?? pick.price} acceptée ✓`) : 'Échec : ' + r.error, 6000);
+        }
         btn.disabled = false; return;
       }
       if (a === 'phoneTest') {
@@ -4157,7 +4197,7 @@
           const auto = clickHandles();                         // l'extension WikiMasters Clic s'en occupe : rien à faire à la main
           pz.innerHTML = hs.length ? `<div class="card" style="border:2px solid #3b82f6"><h3>${auto ? '🖱 Bloqué par le site : l’extension s’en occupe' : '⏸ En pause : le site demande une vérification'}</h3>
             <p class="help">${auto
-              ? `L’extension WikiMasters Clic clique « ${esc(config.unblock.button)} » sur ta page de déblocage, puis le bot reprend aussitôt : rien à faire. Si le site bloque encore, elle réessaie 1 min plus tard, puis toutes les 15 min après ${CLICK_MAX} essais sans effet.${clickLastAt ? ` Dernier clic à ${new Date(clickLastAt).toTimeString().slice(0, 5)}.` : ''}`
+              ? `L’extension WikiMasters Clic mise sur une légendaire à ${config.unblock.max} ou moins, puis le bot reprend aussitôt : rien à faire. Si le site bloque encore, elle réessaie 1 min plus tard, puis toutes les 15 min après ${CLICK_MAX} essais sans effet.${clickLastAt ? ` Dernier clic à ${new Date(clickLastAt).toTimeString().slice(0, 5)}.` : ''}`
               : `${clickHuman ? 'Le site demande une vérification humaine : l’onglet de l’enchère est resté ouvert, fais la vérification (la mise se place toute seule ensuite), puis clique le bouton. ' : ''}Fais l’action une fois à la main sur le site (miser, mettre une carte en vente ou ouvrir un paquet), puis clique le bouton. Le bot réessaie aussi tout seul toutes les 10 min, mais pour les enchères seulement s’il trouve une carte à miser.`}</p>
             ${hs.map(([k, x]) => `<div class="stkbar"><span><b>${HUMAN_NAMES[k] || k}</b> <span class="muted">· depuis ${new Date(x.at).toTimeString().slice(0, 5)}</span></span><button data-a="humanDone" data-key="${esc(k)}">C’est fait, reprendre</button></div>`).join('')}</div>` : '';
         }
